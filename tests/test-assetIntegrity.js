@@ -3,10 +3,12 @@
 /**
  * tests/test-assetIntegrity.js
  * Comprehensive integrity verification for HTML, CSS, and JS assets:
- * 1. Cloudflare Rocket Loader compatibility (data-cfasync="false" on all script tags)
+ * 1. Cloudflare Rocket Loader compatibility (data-cfasync="false" across all views)
  * 2. Background audio continuity (#audioMediaContainer must never be display: none)
  * 3. Local asset reference existence and non-zero size
  * 4. Full syntax and parsing validation for all public/js/*.js files
+ * 5. Mandatory DOM elements and critical control buttons in client.html
+ * 6. Vendor library script loading order precedence
  */
 
 require('should');
@@ -21,35 +23,33 @@ const JS_DIR = path.join(PUBLIC_DIR, 'js');
 const CSS_DIR = path.join(PUBLIC_DIR, 'css');
 
 describe('Pillar 1: Asset Integrity and Cloudflare Compatibility', () => {
-    describe('1. Cloudflare Rocket Loader Script Tags', () => {
-        it('client.html must have data-cfasync="false" on every <script> tag', () => {
-            const clientHtmlPath = path.join(VIEWS_DIR, 'client.html');
-            fs.existsSync(clientHtmlPath).should.be.true('client.html should exist');
-            const html = fs.readFileSync(clientHtmlPath, 'utf8');
+    describe('1. Cloudflare Rocket Loader Script Tags Across All Views', () => {
+        const viewFiles = [
+            'client.html',
+            'landing.html',
+            'waitingRoom.html',
+            'login.html',
+            'newcall.html',
+            'customizeRoom.html',
+            '404.html',
+            'privacy.html',
+            'activeRooms.html',
+            'testStunTurn.html',
+        ];
 
-            const scriptMatches = html.match(/<script\b[^>]*>/gi) || [];
-            scriptMatches.length.should.be.greaterThan(20, 'client.html should contain scripts');
+        viewFiles.forEach((file) => {
+            it(`${file} must have data-cfasync="false" on every <script> tag`, () => {
+                const filePath = path.join(VIEWS_DIR, file);
+                fs.existsSync(filePath).should.be.true(`${file} should exist`);
+                const html = fs.readFileSync(filePath, 'utf8');
 
-            const missingCfTags = scriptMatches.filter((tag) => !tag.includes('data-cfasync="false"'));
-            missingCfTags.should.deepEqual(
-                [],
-                'All script tags in client.html must have data-cfasync="false" to prevent Rocket Loader race conditions'
-            );
-        });
-
-        it('landing.html must have data-cfasync="false" on every <script> tag', () => {
-            const landingHtmlPath = path.join(VIEWS_DIR, 'landing.html');
-            fs.existsSync(landingHtmlPath).should.be.true('landing.html should exist');
-            const html = fs.readFileSync(landingHtmlPath, 'utf8');
-
-            const scriptMatches = html.match(/<script\b[^>]*>/gi) || [];
-            scriptMatches.length.should.be.greaterThan(5, 'landing.html should contain scripts');
-
-            const missingCfTags = scriptMatches.filter((tag) => !tag.includes('data-cfasync="false"'));
-            missingCfTags.should.deepEqual(
-                [],
-                'All script tags in landing.html must have data-cfasync="false" to prevent Rocket Loader race conditions'
-            );
+                const scriptMatches = html.match(/<script\b[^>]*>/gi) || [];
+                const missingCfTags = scriptMatches.filter((tag) => !tag.includes('data-cfasync="false"'));
+                missingCfTags.should.deepEqual(
+                    [],
+                    `All script tags in ${file} must have data-cfasync="false" to prevent Rocket Loader race conditions`
+                );
+            });
         });
     });
 
@@ -78,7 +78,63 @@ describe('Pillar 1: Asset Integrity and Cloudflare Compatibility', () => {
         });
     });
 
-    describe('3. Local Asset Reference Validation', () => {
+    describe('3. Mandatory UI Elements in client.html', () => {
+        let clientHtml;
+
+        before(() => {
+            clientHtml = fs.readFileSync(path.join(VIEWS_DIR, 'client.html'), 'utf8');
+        });
+
+        const mandatoryElementIds = [
+            'videoMediaContainer',
+            'audioMediaContainer',
+            'peersCount',
+            'participantsCountBadge',
+            'leaveRoomBtn',
+            'screenShareBtn',
+            'initScreenShareBtn',
+            'initVideo',
+            'initVideoBtn',
+            'initAudioBtn',
+            'initVideoSelect',
+            'initMicrophoneSelect',
+            'initSpeakerSelect',
+            'initExitBtn',
+            'audioBtn',
+            'videoBtn',
+            'chatRoomBtn',
+        ];
+
+        mandatoryElementIds.forEach((elemId) => {
+            it(`client.html must contain #${elemId}`, () => {
+                const regex = new RegExp(`id=["']${elemId}["']`);
+                regex.test(clientHtml).should.be.true(`Mandatory element #${elemId} must exist in client.html`);
+            });
+        });
+
+        it('client.html must define standard charset and viewport meta tags', () => {
+            clientHtml.should.match(/charset=utf-8/i);
+            clientHtml.should.match(/<meta\s+[^>]*name=["']viewport["']/i);
+        });
+    });
+
+    describe('4. Script Dependency Ordering in client.html', () => {
+        it('vendor adapter and xss must precede application client.js', () => {
+            const clientHtml = fs.readFileSync(path.join(VIEWS_DIR, 'client.html'), 'utf8');
+            const adapterIndex = clientHtml.indexOf('adapter-latest.js');
+            const xssIndex = clientHtml.indexOf('xss.min.js');
+            const clientJsIndex = clientHtml.indexOf('src="../js/client.js"');
+
+            adapterIndex.should.be.greaterThan(-1);
+            xssIndex.should.be.greaterThan(-1);
+            clientJsIndex.should.be.greaterThan(-1);
+
+            adapterIndex.should.be.lessThan(clientJsIndex, 'adapter.js must be declared before client.js');
+            xssIndex.should.be.lessThan(clientJsIndex, 'xss.js must be declared before client.js');
+        });
+    });
+
+    describe('5. Local Asset Reference Validation', () => {
         function verifyHtmlLocalAssets(htmlFile) {
             const htmlPath = path.join(VIEWS_DIR, htmlFile);
             const html = fs.readFileSync(htmlPath, 'utf8');
@@ -112,7 +168,7 @@ describe('Pillar 1: Asset Integrity and Cloudflare Compatibility', () => {
         });
     });
 
-    describe('4. JavaScript Code Syntax and Integrity', () => {
+    describe('6. JavaScript Code Syntax and Integrity', () => {
         it('All JavaScript files in public/js/ must compile cleanly without syntax errors', () => {
             const files = fs.readdirSync(JS_DIR).filter((f) => f.endsWith('.js'));
             files.length.should.be.greaterThan(25, 'Should find client JS files in public/js');
@@ -122,7 +178,6 @@ describe('Pillar 1: Asset Integrity and Cloudflare Compatibility', () => {
                 const filePath = path.join(JS_DIR, file);
                 const content = fs.readFileSync(filePath, 'utf8');
                 try {
-                    // Test parsing using Node vm.Script
                     new vm.Script(content, { filename: file });
                 } catch (err) {
                     errors.push({ file, error: err.message });

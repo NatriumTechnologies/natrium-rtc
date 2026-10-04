@@ -18,7 +18,7 @@
         <meta property="og:image" content="{{OG_IMAGE}}" />
         <meta property="og:url" content="{{OG_URL}}" />
 
-        <script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script>
+        <script data-cfasync="false" src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script>
         <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/all.min.css" />
         <link rel="stylesheet" href="../css/_tokens.css" />
         <link rel="stylesheet" type="text/css" href="../css/activeRooms.css" />
@@ -51,6 +51,6 @@
             </div>
             <div class="rooms" id="rooms"></div>
         </div>
-        <script defer src="../js/activeRooms.js"></script>
+        <script data-cfasync="false" defer src="../js/activeRooms.js"></script>
     </body>
 </html>
