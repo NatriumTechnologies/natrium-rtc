@@ -3413,6 +3413,32 @@ async function handleOnTrack(peer_id, peers) {
         };
 
         if (kind === 'audio') {
+            const extras = peerInfo.extras || {};
+            const screenElement = getId(`${peer_id}___screen`);
+            const existingAudioElement = getId(`${peer_id}___audio`);
+
+            const isScreenAudioByTrack = extras.screen_audio_track_id && extras.screen_audio_track_id === event.track?.id;
+            const isScreenAudioByStream = extras.screen_stream_id && extras.screen_stream_id === inbound.id;
+            const isScreenAudioByVideo = screenElement?.srcObject && screenElement.srcObject.id === inbound.id;
+            const isScreenAudioByInbound = inbound.getVideoTracks?.().length > 0;
+            const isScreenAudioByDiff =
+                peerInfo.peer_screen_status &&
+                existingAudioElement?.srcObject &&
+                existingAudioElement.srcObject.id !== inbound.id;
+
+            const isScreenAudio =
+                isScreenAudioByTrack ||
+                isScreenAudioByStream ||
+                isScreenAudioByVideo ||
+                isScreenAudioByInbound ||
+                isScreenAudioByDiff;
+
+            if (isScreenAudio) {
+                console.log('[ON TRACK] Detected screen audio track for', peer_id);
+                handleRemoteScreenAudio(inbound, peer_id, peer_name);
+                return;
+            }
+
             const audioElement = getId(`${peer_id}___audio`);
 
             if (audioElement) {
@@ -3463,17 +3489,15 @@ async function handleAddTracks(peer_id) {
 
     const videoTrack = getVideoTrack(localVideoMediaStream);
     const screenTrack = getVideoTrack(localScreenMediaStream);
+    const micAudioTrack = getAudioTrack(localAudioMediaStream);
     const screenAudioTrack =
         isScreenStreaming && hasAudioTrack(localScreenMediaStream) ? getAudioTrack(localScreenMediaStream) : null;
-    const micAudioTrack = getAudioTrack(localAudioMediaStream);
-    const audioTrack = screenAudioTrack || micAudioTrack;
-    const audioStream = screenAudioTrack ? localScreenMediaStream : localAudioMediaStream;
 
     console.log('handleAddTracks', {
         videoTrack: videoTrack,
         screenTrack: screenTrack,
+        micAudioTrack: micAudioTrack,
         screenAudioTrack: screenAudioTrack,
-        audioTrack: audioTrack,
     });
 
     if (videoTrack) {
@@ -3486,9 +3510,16 @@ async function handleAddTracks(peer_id) {
         await pc.addTrack(screenTrack, localScreenMediaStream);
     }
 
-    if (audioTrack && audioStream) {
-        console.log('[ADD AUDIO TRACK] to Peer Name [' + peer_name + ']');
-        await pc.addTrack(audioTrack, audioStream);
+    if (micAudioTrack) {
+        console.log('[ADD MIC AUDIO TRACK] to Peer Name [' + peer_name + ']');
+        const s = await pc.addTrack(micAudioTrack, localAudioMediaStream);
+        if (s) s._mediaType = 'mic';
+    }
+
+    if (screenAudioTrack) {
+        console.log('[ADD SCREEN AUDIO TRACK] to Peer Name [' + peer_name + ']');
+        const s = await pc.addTrack(screenAudioTrack, localScreenMediaStream);
+        if (s) s._mediaType = 'screen_audio';
     }
 }
 
@@ -3840,6 +3871,7 @@ function handleRemovePeer(config) {
     const peerScreenId = peer_id + '___screen';
     const peerVideoId = peer_id + '___video';
     const peerAudioId = peer_id + '___audio';
+    const peerScreenAudioId = peer_id + '___screen_audio';
 
     if (peerVideoId in peerVideoMediaElements) {
         const peerVideo = getId(peerVideoId);
@@ -3886,8 +3918,18 @@ function handleRemovePeer(config) {
         audioWrap?.parentNode?.removeChild(audioWrap);
     }
 
+    if (peerScreenAudioId in peerAudioMediaElements) {
+        const audioWrap = peerAudioMediaElements[peerScreenAudioId];
+        const audioEl = audioWrap?.querySelector('audio');
+        if (audioEl && audioEl._audioWatchdog) {
+            clearInterval(audioEl._audioWatchdog);
+            audioEl._audioWatchdog = null;
+        }
+        audioWrap?.parentNode?.removeChild(audioWrap);
+    }
+
     // Fallback: remove any orphan tiles that were not tracked in the media element maps
-    [peerVideoId, peerScreenId, peerAudioId].forEach((id) => {
+    [peerVideoId, peerScreenId, peerAudioId, peerScreenAudioId].forEach((id) => {
         const el = getId(id);
         if (!el) return;
         if (el._audioWatchdog) {
@@ -3929,6 +3971,7 @@ function handleRemovePeer(config) {
     delete peerScreenMediaElements[peerScreenId];
     delete peerVideoMediaElements[peerVideoId];
     delete peerAudioMediaElements[peerAudioId];
+    delete peerAudioMediaElements[peerScreenAudioId];
     delete allPeers[peer_id];
 
     adaptAspectRatio();
@@ -5607,6 +5650,7 @@ async function loadRemoteMediaStream(stream, peers, peer_id, kind) {
             const remoteScreenFileShareBtn = document.createElement('button');
             const remoteScreenPrivateMsgBtn = document.createElement('button');
             const remoteScreenDrawingBtn = document.createElement('button');
+            const remoteScreenAudioVolume = document.createElement('input');
             const remoteScreenDropdownDiv = document.createElement('div');
             const remoteScreenDropdownBtn = document.createElement('button');
             const remoteScreenDropdownContent = document.createElement('div');
@@ -5652,8 +5696,19 @@ async function loadRemoteMediaStream(stream, peers, peer_id, kind) {
             remoteScreenDrawingBtn.setAttribute('aria-label', 'Enable screen drawing');
             remoteScreenDrawingBtn.setAttribute('aria-pressed', 'false');
 
+            // remote screen audio volume element
+            remoteScreenAudioVolume.setAttribute('id', peer_id + '_screen_audioVolume');
+            remoteScreenAudioVolume.type = 'range';
+            remoteScreenAudioVolume.min = 0;
+            remoteScreenAudioVolume.max = 100;
+            remoteScreenAudioVolume.value = 100;
+            remoteScreenAudioVolume.className = 'screen-volume-slider';
+            remoteScreenAudioVolume.style.maxWidth = '40px';
+            remoteScreenAudioVolume.style.cursor = 'pointer';
+
             if (!isMobileDevice) {
                 setTippy(remoteScreenPeerName, 'Participant screen', 'bottom');
+                setTippy(remoteScreenAudioVolume, '🔊 Stream Volume', 'top');
                 setTippy(remoteScreenVideoAudioUrlBtn, 'Send Video or Audio', 'bottom');
                 setTippy(remoteScreenPrivateMsgBtn, 'Open private conversation', 'bottom');
                 setTippy(remoteScreenFileShareBtn, 'Send file', 'bottom');
@@ -5717,6 +5772,15 @@ async function loadRemoteMediaStream(stream, peers, peer_id, kind) {
                 remoteScreenDropdownContent.appendChild(
                     createResponsiveDropdownItem(remoteScreenVideoAudioUrlBtn, 'Send Video/Audio')
                 );
+            if (!isMobileDevice && buttons.remote.showAudioVolume) {
+                const streamVolDropdownItem = createResponsiveDropdownRangeItem(
+                    remoteScreenAudioVolume,
+                    'Stream Volume',
+                    'fa-volume-high'
+                );
+                streamVolDropdownItem.id = peer_id + '_screen_audioVolume_dropdown';
+                remoteScreenDropdownContent.appendChild(streamVolDropdownItem);
+            }
 
             remoteScreenDropdownDiv.appendChild(remoteScreenDropdownBtn);
             document.body.appendChild(remoteScreenDropdownContent);
@@ -5742,7 +5806,26 @@ async function loadRemoteMediaStream(stream, peers, peer_id, kind) {
             buttons.remote.showFileShareBtn && remoteScreenNavBar.appendChild(remoteScreenFileShareBtn);
             buttons.remote.showShareVideoAudioBtn && remoteScreenNavBar.appendChild(remoteScreenVideoAudioUrlBtn);
 
+            if (!isMobileDevice && buttons.remote.showAudioVolume) {
+                remoteScreenNavBar.appendChild(remoteScreenAudioVolume);
+            }
+
             remoteScreenNavBar.appendChild(remoteScreenDropdownDiv);
+
+            const existingScreenAudio = getId(peer_id + '___screen_audio');
+            const peerInfoObj = allPeers?.[peer_id] || peers?.[peer_id] || {};
+            const hasScreenAudio =
+                !!existingScreenAudio || hasAudioTrack(stream) || !!peerInfoObj.extras?.has_screen_audio;
+            if (existingScreenAudio && !isMobileDevice) {
+                try {
+                    handleAudioVolume(remoteScreenAudioVolume.id, existingScreenAudio.id);
+                } catch (e) {
+                    console.warn('[SCREEN AUDIO] Initial handleAudioVolume failed', e);
+                }
+            }
+            elemDisplay(remoteScreenAudioVolume, hasScreenAudio, 'inline');
+            const streamVolDropdownItemEl = getId(peer_id + '_screen_audioVolume_dropdown');
+            if (streamVolDropdownItemEl) elemDisplay(streamVolDropdownItemEl, hasScreenAudio);
 
             remoteScreenMedia.setAttribute('id', peer_id + '___screen');
             remoteScreenMedia.setAttribute('playsinline', true);
@@ -5906,6 +5989,105 @@ async function loadRemoteMediaStream(stream, peers, peer_id, kind) {
             break;
         default:
             break;
+    }
+}
+
+/**
+ * Setup and play remote screen audio separately from user voice audio
+ * @param {MediaStream} stream
+ * @param {string} peer_id
+ * @param {string} peer_name
+ */
+function handleRemoteScreenAudio(stream, peer_id, peer_name) {
+    console.log('SETUP REMOTE SCREEN AUDIO STREAM for', peer_id);
+
+    let screenAudioMedia = getId(peer_id + '___screen_audio');
+    let screenAudioWrap = peerAudioMediaElements[peer_id + '___screen_audio'];
+
+    if (!screenAudioMedia) {
+        screenAudioWrap = document.createElement('div');
+        screenAudioMedia = document.createElement('audio');
+        screenAudioMedia.id = peer_id + '___screen_audio';
+        screenAudioMedia.volume = 1.0;
+        screenAudioMedia.dataset.peerVolume = 1;
+        screenAudioMedia.autoplay = true;
+        screenAudioMedia.controls = false;
+
+        screenAudioWrap.appendChild(screenAudioMedia);
+        if (audioMediaContainer) {
+            audioMediaContainer.appendChild(screenAudioWrap);
+        }
+        peerAudioMediaElements[screenAudioMedia.id] = screenAudioWrap;
+
+        // Resilient audio playback watchdog and event handlers
+        const ensureScreenAudioPlaying = () => {
+            if (screenAudioMedia.paused && screenAudioMedia.srcObject && !screenAudioMedia.muted) {
+                screenAudioMedia.play().catch((err) => {
+                    console.warn('[SCREEN AUDIO] Auto-resume failed for ' + peer_name, err);
+                });
+            }
+        };
+
+        screenAudioMedia.onpause = () => {
+            ensureScreenAudioPlaying();
+        };
+        screenAudioMedia.onstalled = () => {
+            ensureScreenAudioPlaying();
+        };
+        screenAudioMedia.onwaiting = () => {
+            ensureScreenAudioPlaying();
+        };
+
+        const screenAudioTracks = stream.getAudioTracks();
+        if (screenAudioTracks.length > 0) {
+            const track = screenAudioTracks[0];
+            track.onunmute = () => {
+                console.log('[SCREEN AUDIO] Track unmuted for ' + peer_name + ', ensuring playback');
+                ensureScreenAudioPlaying();
+            };
+        }
+
+        const audioWatchdog = setInterval(() => {
+            if (!document.body.contains(screenAudioMedia)) {
+                clearInterval(audioWatchdog);
+                return;
+            }
+            ensureScreenAudioPlaying();
+        }, 5000);
+        screenAudioMedia._audioWatchdog = audioWatchdog;
+    }
+
+    if (!hasAudioTrack(stream)) {
+        screenAudioMedia.muted = true;
+    } else {
+        screenAudioMedia.muted = false;
+    }
+
+    attachMediaStream(screenAudioMedia, stream);
+    applyOutputVolume(screenAudioMedia);
+
+    screenAudioMedia.play().catch((err) => {
+        console.warn('[SCREEN AUDIO] Autoplay prevented for ' + peer_name + ', waiting for interaction:', err);
+        handleAudioFallback(screenAudioMedia, peer_name + ' (screen)');
+    });
+
+    // Wire up screen volume slider if present
+    const screenAudioVolumeEl = getId(peer_id + '_screen_audioVolume');
+    if (screenAudioVolumeEl && !isMobileDevice) {
+        try {
+            handleAudioVolume(screenAudioVolumeEl.id, screenAudioMedia.id);
+            elemDisplay(screenAudioVolumeEl, true, 'inline');
+            const dropdownItem = getId(peer_id + '_screen_audioVolume_dropdown');
+            if (dropdownItem) elemDisplay(dropdownItem, true);
+        } catch (e) {
+            console.warn('[SCREEN AUDIO] handleAudioVolume failed for ' + peer_name, e);
+        }
+    }
+
+    if (sinkId && audioOutputSelect && audioOutputSelect.value) {
+        try {
+            changeAudioDestination(screenAudioMedia, false);
+        } catch (_) {}
     }
 }
 
@@ -10284,17 +10466,14 @@ async function startScreenSharing(constraints, init) {
         return;
     }
     const screenAudioTrack = getAudioTrack(displayStream);
-    const micAudioTrack =
-        myAudioStatus && hasAudioTrack(localAudioMediaStream) ? getAudioTrack(localAudioMediaStream) : null;
     if (screenShareAudioContext) {
         try {
             await screenShareAudioContext.close();
         } catch (_) {}
         screenShareAudioContext = null;
     }
-    const outgoingAudioTrack = await mixScreenAndMicAudio(screenAudioTrack, micAudioTrack);
-    localScreenMediaStream = outgoingAudioTrack
-        ? new MediaStream([screenVideoTrack, outgoingAudioTrack])
+    localScreenMediaStream = screenAudioTrack
+        ? new MediaStream([screenVideoTrack, screenAudioTrack])
         : new MediaStream([screenVideoTrack]);
     isScreenStreaming = true;
     myScreenStatus = true;
@@ -10490,7 +10669,15 @@ function updateScreenSharingUI(isScreenStreaming, init) {
 function getLocalScreenExtras() {
     try {
         const track = getVideoTrack(localScreenMediaStream);
-        return track ? { screen_track_id: track.id, screen_stream_id: localScreenMediaStream.id } : undefined;
+        const audioTrack = hasAudioTrack(localScreenMediaStream) ? getAudioTrack(localScreenMediaStream) : null;
+        return track
+            ? {
+                  screen_track_id: track.id,
+                  screen_stream_id: localScreenMediaStream.id,
+                  screen_audio_track_id: audioTrack ? audioTrack.id : undefined,
+                  has_screen_audio: !!audioTrack,
+              }
+            : undefined;
     } catch (e) {
         return undefined;
     }
@@ -10639,18 +10826,10 @@ async function refreshMyStreamToPeers(stream, localAudioTrackChange = false, isC
     // Current local tracks
     const cameraTrack = getVideoTrack(localVideoMediaStream);
     const screenTrack = getVideoTrack(localScreenMediaStream);
-
-    // Determine which audio track to use.
-    // While screen sharing, prefer the screen-share audio track (which may be mixed screen+mic).
-    // Always prefer mic audio when not screen sharing
-    let audioTrack, audioStream;
-    if (isScreenStreaming && hasAudioTrack(localScreenMediaStream)) {
-        audioTrack = getAudioTrack(localScreenMediaStream);
-        audioStream = localScreenMediaStream;
-    } else {
-        audioTrack = getAudioTrack(localAudioMediaStream);
-        audioStream = localAudioMediaStream;
-    }
+    const micAudioTrack =
+        getAudioTrack(localAudioMediaStream) || (stream && hasAudioTrack(stream) ? getAudioTrack(stream) : null);
+    const screenAudioTrack =
+        isScreenStreaming && hasAudioTrack(localScreenMediaStream) ? getAudioTrack(localScreenMediaStream) : null;
 
     // Push tracks to every peer
     for (const peer_id in peerConnections) {
@@ -10659,7 +10838,6 @@ async function refreshMyStreamToPeers(stream, localAudioTrackChange = false, isC
 
         const senders = pc.getSenders();
         const videoSenders = senders.filter((s) => s.track && s.track.kind === 'video');
-        const audioSender = senders.find((s) => s.track && s.track.kind === 'audio');
 
         // Camera track management (sender index 0)
         if (cameraTrack) {
@@ -10706,14 +10884,61 @@ async function refreshMyStreamToPeers(stream, localAudioTrackChange = false, isC
 
         // Audio track management
         if (isCurrent && !isCurrent()) return;
-        if (audioTrack) {
-            if (audioSender) {
-                await audioSender.replaceTrack(audioTrack);
-                console.log('REPLACE AUDIO TRACK TO', { peer_id, peer_name, audioTrack });
+
+        const audioSenders = senders.filter(
+            (s) => (s.track && s.track.kind === 'audio') || s._mediaType === 'mic' || s._mediaType === 'screen_audio'
+        );
+        let micSender = audioSenders.find(
+            (s) => s._mediaType === 'mic' || (s.track && micAudioTrack && s.track.id === micAudioTrack.id)
+        );
+        let screenAudioSender = audioSenders.find(
+            (s) =>
+                s._mediaType === 'screen_audio' ||
+                (s.track && screenAudioTrack && s.track.id === screenAudioTrack.id)
+        );
+
+        if (!micSender && audioSenders.length > 0) {
+            micSender = audioSenders.find((s) => s !== screenAudioSender);
+            if (micSender) micSender._mediaType = 'mic';
+        }
+        if (!screenAudioSender && audioSenders.length > 1) {
+            screenAudioSender = audioSenders.find((s) => s !== micSender);
+            if (screenAudioSender) screenAudioSender._mediaType = 'screen_audio';
+        }
+
+        // Microphone audio track management
+        if (micAudioTrack) {
+            if (micSender) {
+                await micSender.replaceTrack(micAudioTrack);
+                console.log('REPLACE MIC AUDIO TRACK TO', { peer_id, peer_name, micAudioTrack });
             } else {
-                pc.addTrack(audioTrack, audioStream || new MediaStream([audioTrack]));
+                const s = pc.addTrack(micAudioTrack, localAudioMediaStream || new MediaStream([micAudioTrack]));
+                if (s) s._mediaType = 'mic';
                 await handleRtcOffer(peer_id);
-                console.log('ADD AUDIO TRACK TO', { peer_id, peer_name, audioTrack });
+                console.log('ADD MIC AUDIO TRACK TO', { peer_id, peer_name, micAudioTrack });
+            }
+        }
+
+        // Screen audio track management
+        if (screenAudioTrack) {
+            if (screenAudioSender) {
+                await screenAudioSender.replaceTrack(screenAudioTrack);
+                console.log('REPLACE SCREEN AUDIO TRACK TO', { peer_id, peer_name, screenAudioTrack });
+            } else {
+                const s = pc.addTrack(screenAudioTrack, localScreenMediaStream || new MediaStream([screenAudioTrack]));
+                if (s) s._mediaType = 'screen_audio';
+                await handleRtcOffer(peer_id);
+                console.log('ADD SCREEN AUDIO TRACK TO', { peer_id, peer_name, screenAudioTrack });
+            }
+        } else {
+            if (screenAudioSender) {
+                try {
+                    pc.removeTrack(screenAudioSender);
+                    await handleRtcOffer(peer_id);
+                    console.log('REMOVE SCREEN AUDIO SENDER FROM', { peer_id, peer_name });
+                } catch (e) {
+                    console.warn('REMOVE SCREEN AUDIO SENDER FAILED', e);
+                }
             }
         }
     }
@@ -14292,11 +14517,17 @@ function handleAudioVolume(audioVolumeId, mediaId) {
         audioVolume.style.maxWidth = '40px';
         audioVolume.style.display = 'inline';
         audioVolume.style.cursor = 'pointer';
-        audioVolume.value = 100;
-        audioVolume.addEventListener('input', () => {
-            media.dataset.peerVolume = audioVolume.value / 100;
-            applyOutputVolume(media);
-        });
+        audioVolume.value = Math.round((Number(media.dataset.peerVolume) || 1) * 100);
+        if (!audioVolume._hasVolumeListener) {
+            audioVolume._hasVolumeListener = true;
+            audioVolume.addEventListener('input', () => {
+                const targetMedia = getId(mediaId);
+                if (targetMedia) {
+                    targetMedia.dataset.peerVolume = audioVolume.value / 100;
+                    applyOutputVolume(targetMedia);
+                }
+            });
+        }
     } else {
         if (audioVolume) elemDisplay(audioVolume, false);
     }
@@ -14900,6 +15131,8 @@ function handleScreenStart(peer_id, extras) {
 
         allPeers[peer_id]['extras']['screen_track_id'] = extras.screen_track_id;
         allPeers[peer_id]['extras']['screen_stream_id'] = extras.screen_stream_id;
+        allPeers[peer_id]['extras']['screen_audio_track_id'] = extras.screen_audio_track_id;
+        allPeers[peer_id]['extras']['has_screen_audio'] = extras.has_screen_audio;
 
         // Also update peer screen status flag for fallback classification
         allPeers[peer_id]['peer_screen_status'] = true;
@@ -14952,6 +15185,29 @@ function handleScreenStop(peer_id, peer_use_video) {
         });
         adaptAspectRatio();
     }
+
+    // Clean up dedicated remote screen audio element if present
+    const screenAudioId = peer_id + '___screen_audio';
+    if (screenAudioId in peerAudioMediaElements) {
+        const audioWrap = peerAudioMediaElements[screenAudioId];
+        const audioEl = audioWrap?.querySelector('audio');
+        if (audioEl && audioEl._audioWatchdog) {
+            clearInterval(audioEl._audioWatchdog);
+            audioEl._audioWatchdog = null;
+        }
+        audioWrap?.parentNode?.removeChild(audioWrap);
+        delete peerAudioMediaElements[screenAudioId];
+    } else {
+        const audioEl = getId(screenAudioId);
+        if (audioEl) {
+            if (audioEl._audioWatchdog) {
+                clearInterval(audioEl._audioWatchdog);
+                audioEl._audioWatchdog = null;
+            }
+            audioEl.closest('div')?.remove() || audioEl.remove();
+        }
+    }
+
     if (remoteScreenAvatarImage && remoteScreenStream && !peer_use_video) {
         elemDisplay(remoteScreenAvatarImage, true, 'block');
         remoteScreenStream.srcObject.getVideoTracks().forEach((track) => {
@@ -14967,6 +15223,8 @@ function handleScreenStop(peer_id, peer_use_video) {
         if (allPeers[peer_id]['extras']) {
             delete allPeers[peer_id]['extras']['screen_track_id'];
             delete allPeers[peer_id]['extras']['screen_stream_id'];
+            delete allPeers[peer_id]['extras']['screen_audio_track_id'];
+            delete allPeers[peer_id]['extras']['has_screen_audio'];
         }
         // Update screen status flag
         allPeers[peer_id]['peer_screen_status'] = false;
