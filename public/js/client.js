@@ -689,6 +689,7 @@ let initStream; // initial webcam stream
 let localVideoMediaStream; // my webcam
 let localScreenMediaStream; // my screen share
 let localScreenDisplayStream; // raw getDisplayMedia stream (may include audio)
+let isScreenShareStarting = false; // guard to prevent duplicate concurrent screen share dialogs
 let screenShareAudioContext; // AudioContext used to mix screen audio + microphone
 let localAudioMediaStream; // my microphone
 let noiseProcessor = null; // RNNoise audio processing
@@ -1029,7 +1030,7 @@ function refreshMainButtonsToolTipPlacement() {
     // BottomButtons
     bottomButtonsPlacement = btnsBarSelect.options[btnsBarSelect.selectedIndex].value == 'vertical' ? 'top' : 'right';
 
-    updateLeaveRoomTooltip(videoMediaContainer.childElementCount);
+    updateLeaveRoomTooltip(getRoomParticipantsCount());
 
     setTippy(audioBtn, useAudio ? 'Stop the audio (A)' : 'My audio is disabled', bottomButtonsPlacement);
     setTippy(videoBtn, useVideo ? 'Stop the video (V)' : 'My video is disabled', bottomButtonsPlacement);
@@ -3896,6 +3897,9 @@ function handleRemovePeer(config) {
         const wrap = el.closest('.Camera') || el;
         wrap.parentNode?.removeChild(wrap);
     });
+    document.querySelectorAll(`[id="${peer_id}_videoWrap"], [id="${peer_id}_screenWrap"]`).forEach((el) => {
+        el.remove();
+    });
 
     if (peer_id in peerConnections) peerConnections[peer_id].close();
 
@@ -5076,6 +5080,14 @@ async function loadLocalMedia(stream, kind) {
             myScreenMedia.volume = 0;
             myScreenMedia.controls = false;
 
+            const existingScreenWraps = document.querySelectorAll('#myScreenWrap, .Screen#myScreenWrap');
+            existingScreenWraps.forEach((el) => {
+                VideoDrawingOverlay.destroyById(myPeerId);
+                const dropdown = el.querySelector('#myScreenDropdownBtn');
+                if (dropdown && dropdown._dropdownContent) dropdown._dropdownContent.remove();
+                el.remove();
+            });
+
             myScreenWrap.className = 'Screen';
             myScreenWrap.setAttribute('id', 'myScreenWrap');
 
@@ -5446,6 +5458,13 @@ async function loadRemoteMediaStream(stream, peers, peer_id, kind) {
             remoteMedia.style.name = peer_id + '_typeCam';
             remoteMedia.controls = remoteMediaControls;
 
+            const existingRemoteVideos = document.querySelectorAll(`[id="${peer_id}_videoWrap"]`);
+            existingRemoteVideos.forEach((el) => {
+                const dropdown = el.querySelector(`#${peer_id}_dropdownBtn`);
+                if (dropdown && dropdown._dropdownContent) dropdown._dropdownContent.remove();
+                el.remove();
+            });
+
             remoteVideoWrap.className = 'Camera';
             remoteVideoWrap.setAttribute('id', peer_id + '_videoWrap');
             remoteVideoWrap.style.display = isHideALLVideosActive ? 'none' : 'block';
@@ -5732,6 +5751,14 @@ async function loadRemoteMediaStream(stream, peers, peer_id, kind) {
             remoteScreenMedia.controls = remoteMediaControls;
             remoteScreenMedia.style.objectFit = 'contain';
             remoteScreenMedia.style.name = peer_id + '_typeScreen';
+
+            const existingRemoteScreens = document.querySelectorAll(`[id="${peer_id}_screenWrap"]`);
+            existingRemoteScreens.forEach((el) => {
+                VideoDrawingOverlay.destroyById(peer_id);
+                const dropdown = el.querySelector(`#${peer_id}_screenDropdownBtn`);
+                if (dropdown && dropdown._dropdownContent) dropdown._dropdownContent.remove();
+                el.remove();
+            });
 
             remoteScreenWrap.className = 'Screen';
             remoteScreenWrap.setAttribute('id', peer_id + '_screenWrap');
@@ -6088,12 +6115,31 @@ function logStreamSettingsInfo(name, stream) {
 }
 
 /**
+ * Calculate the accurate human participants count in the room.
+ * Excludes metadata keys in allPeers and falls back to peerConnections.
+ * @returns {number} count of participants in the room
+ */
+function getRoomParticipantsCount() {
+    if (allPeers && typeof allPeers === 'object') {
+        const metaKeys = new Set(['lock', 'password', 'joinLock']);
+        const validPeerIds = Object.keys(allPeers).filter(
+            (k) => !metaKeys.has(k) && allPeers[k] && typeof allPeers[k] === 'object'
+        );
+        if (validPeerIds.length > 0) {
+            return validPeerIds.includes(myPeerId) ? validPeerIds.length : validPeerIds.length + 1;
+        }
+    }
+    return 1 + Object.keys(peerConnections || {}).length;
+}
+
+/**
  * Handle aspect ratio
  * ['0:0', '4:3', '16:9', '1:1', '1:2'];
  *    0      1       2      3      4
  */
 function adaptAspectRatio() {
-    const participantsCount = videoMediaContainer.childElementCount;
+    const tilesCount = videoMediaContainer ? videoMediaContainer.childElementCount : 1;
+    const participantsCount = getRoomParticipantsCount();
     if (peersCount) peersCount.innerText = participantsCount;
     updateLeaveRoomTooltip(participantsCount);
     let desktop,
@@ -6114,7 +6160,7 @@ function adaptAspectRatio() {
     }
 
     // desktop aspect ratio
-    switch (participantsCount) {
+    switch (tilesCount) {
         // case 1:
         //     desktop = 0; // (0:0)
         //     break;
@@ -6139,7 +6185,7 @@ function adaptAspectRatio() {
             desktop = 0; // (0:0)
     }
     // mobile aspect ratio
-    switch (participantsCount) {
+    switch (tilesCount) {
         case 3:
         case 9:
         case 10:
@@ -6160,7 +6206,7 @@ function adaptAspectRatio() {
         default:
             mobile = 3; // (1:1)
     }
-    if (participantsCount > 11) {
+    if (tilesCount > 11) {
         desktop = 1; // (4:3)
         mobile = 3; // (1:1)
     }
@@ -10175,7 +10221,16 @@ async function loadScreenMedia() {
  * @param {boolean} init - Indicates if it's the initial screen share state
  */
 async function toggleScreenSharing(init = false) {
+    if (isScreenShareStarting) {
+        console.warn('[ScreenShare] Screen share start already in progress');
+        return;
+    }
     try {
+        if (!isScreenStreaming) {
+            isScreenShareStarting = true;
+            if (screenShareBtn) screenShareBtn.style.pointerEvents = 'none';
+            if (initScreenShareBtn) initScreenShareBtn.style.pointerEvents = 'none';
+        }
         screenMaxFrameRate = parseInt(screenFpsSelect.value, 10);
         const constraints = getScreenShareConstraints();
         isVideoPrivacyActive = false;
@@ -10185,12 +10240,16 @@ async function toggleScreenSharing(init = false) {
 
         updateScreenSharingUI(isScreenStreaming, init);
     } catch (err) {
-        if (err && err.name === 'NotAllowedError') {
-            console.error('[ScreenShare] Screen sharing permission was denied by the user.');
+        if (err && (err.name === 'NotAllowedError' || err.name === 'AbortError')) {
+            console.warn('[ScreenShare] Screen sharing cancelled or permission denied:', err.message || err.name);
         } else {
             await handleToggleScreenException(`[Warning] Unable to share the screen: ${err}`, init);
         }
         if (init) return;
+    } finally {
+        isScreenShareStarting = false;
+        if (screenShareBtn) screenShareBtn.style.pointerEvents = '';
+        if (initScreenShareBtn) initScreenShareBtn.style.pointerEvents = '';
     }
 }
 
@@ -10210,12 +10269,18 @@ function getScreenShareConstraints() {
  * @param {boolean} init - Indicates if it's the initial screen share
  */
 async function startScreenSharing(constraints, init) {
+    if (localScreenDisplayStream || localScreenMediaStream) {
+        console.warn('[ScreenShare] Existing screen stream detected, stopping prior stream');
+        await stopScreenSharing(init);
+    }
+
     const displayStream = await navigator.mediaDevices.getDisplayMedia(constraints);
     if (!displayStream) return;
     localScreenDisplayStream = displayStream;
     const screenVideoTrack = getVideoTrack(displayStream);
     if (!screenVideoTrack) {
         console.error('[ScreenShare] No video track in display stream');
+        await stopTracks(displayStream);
         return;
     }
     const screenAudioTrack = getAudioTrack(displayStream);
@@ -10246,7 +10311,10 @@ async function startScreenSharing(constraints, init) {
         await refreshMyStreamToPeers(undefined, true);
     }
     screenVideoTrack.onended = () => {
-        if (isScreenStreaming) toggleScreenSharing(init);
+        screenVideoTrack.onended = null;
+        if (isScreenStreaming && !isScreenShareStarting) {
+            toggleScreenSharing(init);
+        }
     };
     if (init) {
         if (initStream) await stopTracks(initStream);
@@ -10276,30 +10344,39 @@ async function startScreenSharing(constraints, init) {
  * @param {boolean} init - Indicates if it's the initial screen share
  */
 async function stopScreenSharing(init) {
+    // Immediately clear screen sharing flags so asynchronous track events or concurrent calls do not re-enter
+    isScreenStreaming = false;
+    myScreenStatus = false;
+
     const myScreenWrap = getId('myScreenWrap');
     const myScreenPinBtn = getId('myScreenPinBtn');
     if (!init && myScreenWrap && isVideoPinned && pinnedVideoPlayerId === 'myScreen') {
         console.log('[ScreenShare] Unpinning my screen before removal');
         if (myScreenPinBtn) myScreenPinBtn.click();
     }
-    if (!init && myScreenWrap) {
+    if (!init) {
         VideoDrawingOverlay.destroyById(myPeerId);
-        const myScreenDropdownBtn = getId('myScreenDropdownBtn');
-        if (myScreenDropdownBtn && myScreenDropdownBtn._dropdownContent) {
-            myScreenDropdownBtn._dropdownContent.remove();
-        }
-        myScreenWrap.remove();
+        const screenWraps = document.querySelectorAll('#myScreenWrap, .Screen#myScreenWrap');
+        screenWraps.forEach((wrap) => {
+            const dropdown = wrap.querySelector('#myScreenDropdownBtn') || getId('myScreenDropdownBtn');
+            if (dropdown && dropdown._dropdownContent) {
+                dropdown._dropdownContent.remove();
+            }
+            wrap.remove();
+        });
     }
     const activeMicTrack = getAudioTrack(localAudioMediaStream);
     if (localScreenMediaStream) {
         localScreenMediaStream.getTracks().forEach((t) => {
             if (activeMicTrack && t.id === activeMicTrack.id) return;
+            t.onended = null;
             t.stop();
         });
     }
     if (localScreenDisplayStream) {
         localScreenDisplayStream.getTracks().forEach((t) => {
             if (activeMicTrack && t.id === activeMicTrack.id) return;
+            t.onended = null;
             t.stop();
         });
     }
@@ -10312,8 +10389,6 @@ async function stopScreenSharing(init) {
     }
     localScreenMediaStream = null;
     if (!init) adaptAspectRatio();
-    isScreenStreaming = false;
-    myScreenStatus = false;
     if (!init) {
         emitPeersAction('screenStop');
         try {
@@ -10335,6 +10410,7 @@ async function stopScreenSharing(init) {
                 console.log('[ScreenShare] Refreshing mic audio after screen share stop');
             }
         }
+        await refreshMyStreamToPeers(undefined, false);
         screenReaderAccessibility.announceMessage('Screen sharing stopped');
     }
     if (init) {
@@ -14866,9 +14942,14 @@ function handleScreenStop(peer_id, peer_use_video) {
     }
 
     // Remove dedicated remote screen tile if present
-    if (remoteScreenWrap) {
+    const existingRemoteScreens = document.querySelectorAll(`[id="${peer_id}_screenWrap"]`);
+    if (existingRemoteScreens.length > 0) {
         VideoDrawingOverlay.destroyById(peer_id);
-        remoteScreenWrap.remove();
+        existingRemoteScreens.forEach((wrap) => {
+            const dropdown = wrap.querySelector(`#${peer_id}_screenDropdownBtn`) || getId(peer_id + '_screenDropdownBtn');
+            if (dropdown && dropdown._dropdownContent) dropdown._dropdownContent.remove();
+            wrap.remove();
+        });
         adaptAspectRatio();
     }
     if (remoteScreenAvatarImage && remoteScreenStream && !peer_use_video) {
