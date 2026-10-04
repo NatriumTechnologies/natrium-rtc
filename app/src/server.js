@@ -412,10 +412,32 @@ const videoDrawingAnnotations = {}; // persistent screen drawing annotation stat
 const videoDrawingPermissions = {};
 
 const roomMetaKeys = new Set(['lock', 'password', 'joinLock']);
+const peerUuids = {}; // tracks socket.id -> peer_uuid per channel for zombie eviction
 
 function getPeerCount(roomId) {
     if (!peers[roomId]) return 0;
     return Object.keys(peers[roomId]).filter((k) => !roomMetaKeys.has(k)).length;
+}
+
+/**
+ * Return a sanitized copy of peers[roomId] with plaintext passwords and private UUIDs omitted
+ */
+function getSanitizedPeers(roomId) {
+    if (!peers[roomId]) return {};
+    const sanitized = {};
+    for (const [key, value] of Object.entries(peers[roomId])) {
+        if (key === 'password') {
+            // Never expose plaintext room password over signaling
+            continue;
+        }
+        if (typeof value === 'object' && value !== null) {
+            sanitized[key] = { ...value };
+            delete sanitized[key].peer_uuid;
+        } else {
+            sanitized[key] = value;
+        }
+    }
+    return sanitized;
 }
 
 app.set('trust proxy', trustProxy); // Enables trust for proxy headers (e.g., X-Forwarded-For) based on the trustProxy setting
@@ -1564,6 +1586,36 @@ io.sockets.on('connect', async (socket) => {
         if (!(channel in peers)) peers[channel] = {};
         if (!(channel in presenters)) presenters[channel] = {};
 
+        // Evict zombie / stale sockets belonging to the same peer_uuid on reconnection
+        if (peer_uuid && channels[channel]) {
+            for (const existingSocketId of Object.keys(channels[channel])) {
+                if (existingSocketId !== socket.id) {
+                    const existingUuid = peerUuids[channel]?.[existingSocketId];
+                    if (existingUuid && existingUuid === peer_uuid) {
+                        const isLivePresenter =
+                            sockets[existingSocketId]?.connected &&
+                            presenters[channel]?.[existingSocketId]?.is_presenter;
+
+                        // A live, actively connected presenter must never be evicted or displaced
+                        if (isLivePresenter) {
+                            continue;
+                        }
+
+                        log.info(
+                            `[ZombieEviction] Evicting stale socket [${existingSocketId}] for reconnecting peer [${peer_name}] (${peer_uuid}) in room [${channel}]`
+                        );
+                        const staleSocket = channels[channel][existingSocketId];
+                        if (staleSocket) {
+                            await removePeerFrom(channel, staleSocket, 'replaced_by_reconnect');
+                            try {
+                                staleSocket.disconnect(true);
+                            } catch (_) {}
+                        }
+                    }
+                }
+            }
+        }
+
         // room locked by the participants can't join
         if (peers[channel]['lock'] === true && peers[channel]['password'] != channel_password) {
             log.debug('[' + socket.id + '] [Warning] Room Is Locked', channel);
@@ -1640,6 +1692,9 @@ io.sockets.on('connect', async (socket) => {
             browser: browserName ? `${browserName} ${browserVersion}` : '',
             extras: extras,
         };
+
+        if (!(channel in peerUuids)) peerUuids[channel] = {};
+        peerUuids[channel][socket.id] = peer_uuid;
 
         const activeRooms = getActiveRooms();
 
@@ -2852,18 +2907,19 @@ io.sockets.on('connect', async (socket) => {
      * @param {string} channel room id
      */
     async function addPeerTo(channel) {
+        const sanitizedPeers = getSanitizedPeers(channel);
         for (let id in channels[channel]) {
             // offer false
             await channels[channel][id].emit('addPeer', {
                 peer_id: socket.id,
-                peers: peers[channel],
+                peers: sanitizedPeers,
                 should_create_offer: false,
                 iceServers: iceServers,
             });
             // offer true
             socket.emit('addPeer', {
                 peer_id: id,
-                peers: peers[channel],
+                peers: sanitizedPeers,
                 should_create_offer: true,
                 iceServers: iceServers,
             });
@@ -2933,6 +2989,9 @@ io.sockets.on('connect', async (socket) => {
             delete socket.channels[channel];
             delete channels[channel][socket.id];
             delete peers[channel][socket.id]; // delete peer data from the room
+            if (peerUuids[channel]) {
+                delete peerUuids[channel][socket.id];
+            }
 
             if (getPeerCount(channel) === 0) {
                 delete peers[channel];
@@ -2943,6 +3002,7 @@ io.sockets.on('connect', async (socket) => {
                 delete videoTextAnnotations[channel]; // Clean up persistent screen annotation state
                 delete videoDrawingAnnotations[channel]; // Clean up persistent screen drawing state
                 delete videoDrawingPermissions[channel];
+                delete peerUuids[channel];
             }
         } catch (err) {
             log.error('Remove Peer', toJson(err));

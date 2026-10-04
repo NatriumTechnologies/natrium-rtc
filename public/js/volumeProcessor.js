@@ -3,6 +3,7 @@ class VolumeProcessor extends AudioWorkletProcessor {
     constructor(options) {
         super();
         this.threshold = options.processorOptions.threshold || 10;
+        this.silenceThreshold = options.processorOptions.silenceThreshold || 0.01;
         this.peerId = options.processorOptions.peerId || '';
         this.lastSendTime = 0;
     }
