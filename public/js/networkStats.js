@@ -29,11 +29,16 @@ async function getNetworkStats(pc) {
     let rttSum = 0;
     let rttCount = 0;
 
-    if (!pc) {
+    if (!pc || pc.signalingState === 'closed' || pc.connectionState === 'closed') {
         return { bytesSent, bytesReceived, packetsLost, jitter: 0, rtt: 0 };
     }
 
-    const stats = await pc.getStats();
+    let stats;
+    try {
+        stats = await pc.getStats();
+    } catch {
+        return { bytesSent, bytesReceived, packetsLost, jitter: 0, rtt: 0 };
+    }
 
     stats.forEach((report) => {
         // Outbound: Anything we send (audio/video)
@@ -90,11 +95,11 @@ function timeToReadable(seconds) {
 
 /** Display into UI */
 function showNetworkStats(stats) {
-    networkSent.innerText = bytesToSize(stats.bytesSent);
-    networkReceived.innerText = bytesToSize(stats.bytesReceived);
-    networkJitter.innerText = timeToReadable(stats.jitter);
-    networkPacketLost.innerText = stats.packetsLost;
-    networkRtt.innerText = timeToReadable(stats.rtt);
+    if (networkSent) networkSent.innerText = bytesToSize(stats.bytesSent);
+    if (networkReceived) networkReceived.innerText = bytesToSize(stats.bytesReceived);
+    if (networkJitter) networkJitter.innerText = timeToReadable(stats.jitter);
+    if (networkPacketLost) networkPacketLost.innerText = stats.packetsLost;
+    if (networkRtt) networkRtt.innerText = timeToReadable(stats.rtt);
 }
 
 /**

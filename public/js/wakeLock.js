@@ -10,13 +10,20 @@ function isWakeLockSupported() {
     return !!navigator?.wakeLock?.request;
 }
 
+function isDesktop() {
+    return typeof isDesktopDevice !== 'undefined' ? isDesktopDevice : false;
+}
+
 function isAudioOrUIActive() {
-    return (myAudioStatus || userWantsKeepAwake) && !myVideoStatus && !myScreenStatus;
+    const audioStatus = typeof myAudioStatus !== 'undefined' ? myAudioStatus : false;
+    const videoStatus = typeof myVideoStatus !== 'undefined' ? myVideoStatus : false;
+    const screenStatus = typeof myScreenStatus !== 'undefined' ? myScreenStatus : false;
+    return (audioStatus || userWantsKeepAwake) && !videoStatus && !screenStatus;
 }
 
 function shouldKeepAwake() {
     return (
-        !isDesktopDevice &&
+        !isDesktop() &&
         isWakeLockSupported() &&
         document.visibilityState === 'visible' &&
         !document.pictureInPictureElement &&
@@ -32,23 +39,23 @@ async function requestWakeLock() {
             wakeLockSentinel = null;
             syncWakeLockDebounced();
         });
-        switchKeepAwake.checked = true;
-        userLog('toast', '🟢 Wake Lock is active');
+        if (typeof switchKeepAwake !== 'undefined' && switchKeepAwake) switchKeepAwake.checked = true;
+        if (typeof userLog === 'function') userLog('toast', '🟢 Wake Lock is active');
     } catch (err) {
         wakeLockSentinel = null;
-        switchKeepAwake.checked = false;
-        userLog('toast', '🔴 Failed to request Wake Lock: ' + err.message);
+        if (typeof switchKeepAwake !== 'undefined' && switchKeepAwake) switchKeepAwake.checked = false;
+        if (typeof userLog === 'function') userLog('toast', '🔴 Failed to request Wake Lock: ' + err.message);
     }
 }
 
 async function releaseWakeLock() {
-    if (isDesktopDevice) return;
+    if (isDesktop()) return;
     try {
         await wakeLockSentinel?.release();
-        userLog('toast', '⚪ Wake Lock released');
+        if (typeof userLog === 'function') userLog('toast', '⚪ Wake Lock released');
     } catch {}
     wakeLockSentinel = null;
-    switchKeepAwake.checked = false;
+    if (typeof switchKeepAwake !== 'undefined' && switchKeepAwake) switchKeepAwake.checked = false;
 }
 
 function syncWakeLockDebounced() {

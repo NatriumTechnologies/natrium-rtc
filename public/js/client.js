@@ -659,6 +659,9 @@ let notify = getNotify(); // popup room sharing on join
 let chat = getChat(); // popup chat on join
 let notifyBySound = true; // turn on - off sound notifications
 let isPeerReconnected = false;
+let peerNegotiation = {}; // peer_id -> { makingOffer, ignoreOffer, iceRestart } (perfect negotiation)
+let peerDisconnectTimers = {}; // peer_id -> timeout id (ICE restart after 'disconnected')
+let peerTileTimers = {}; // peer_id -> timeout id (tile safety net)
 
 // media
 let useAudio = true; // User allow for microphone usage
@@ -3159,9 +3162,16 @@ async function handleAddPeer(config) {
     await handleRTCDataChannels(peer_id);
     await handleOnTrack(peer_id, peers);
 
+    // The peer may have left while we were awaiting above
+    if (peerConnections[peer_id] !== peerConnection) return;
+
     if ((!peer_video_status || !peer_screen_status) && !needToCreateOfferByPeer[peer_id]) {
         needToCreateOfferByPeer[peer_id] = true;
     }
+
+    // Only the designated offerer starts the initial negotiation (avoids both sides offering at once,
+    // which broke the SCTP/data channel m-line). The other side registers its handler lazily
+    // (needToCreateOfferByPeer / ICE restart); collisions are still handled in handleSessionDescription.
     if (should_create_offer) {
         await handleRtcOffer(peer_id);
         console.log('[RTCPeerConnection] - SHOULD CREATE OFFER', {
@@ -3173,6 +3183,9 @@ async function handleAddPeer(config) {
 
     // Add tracks (this will trigger onnegotiationneeded if needed)
     await handleAddTracks(peer_id);
+
+    // Safety net: never leave a connected participant without a tile
+    scheduleEnsurePeerTile(peer_id, 5000);
 
     // Create camera tile for peer without camera to show their avatar or has screen sharing on but camera off
     if (!peer_video || (peer_screen_status && !peer_video_status)) {
@@ -3205,17 +3218,93 @@ function emitMyPeerProfile() {
  * @param {string} peer_id socket.id
  */
 async function handlePeersConnectionStatus(peer_id) {
-    peerConnections[peer_id].onconnectionstatechange = function (event) {
-        const connectionStatus = event.currentTarget.connectionState;
-        const signalingState = event.currentTarget.signalingState;
-        const peerName = allPeers[peer_id]['peer_name'];
+    const pc = peerConnections[peer_id];
+    pc.onconnectionstatechange = function () {
+        // Ignore events from stale connections that were already replaced/removed
+        if (peerConnections[peer_id] !== pc) return;
+
+        const connectionStatus = pc.connectionState;
+        const signalingState = pc.signalingState;
+        const peerName = allPeers?.[peer_id]?.['peer_name'] || 'Unknown';
         console.log('[RTCPeerConnection] - CONNECTION', {
             peer_id: peer_id,
             peer_name: peerName,
             connectionStatus: connectionStatus,
             signalingState: signalingState,
         });
+
+        clearTimeout(peerDisconnectTimers[peer_id]);
+
+        switch (connectionStatus) {
+            case 'connected':
+                scheduleEnsurePeerTile(peer_id, 1500);
+                break;
+            case 'disconnected':
+                // Often transient (network blip); give it a few seconds before forcing an ICE restart
+                peerDisconnectTimers[peer_id] = setTimeout(() => restartPeerIce(peer_id), 4000);
+                break;
+            case 'failed':
+                restartPeerIce(peer_id);
+                break;
+            default:
+                break;
+        }
     };
+}
+
+/**
+ * Restart ICE for a peer connection (triggers renegotiation through onnegotiationneeded)
+ * @param {string} peer_id socket.id
+ */
+function restartPeerIce(peer_id) {
+    const pc = peerConnections[peer_id];
+    if (!pc || pc.signalingState === 'closed') return;
+    if (pc.connectionState === 'connected' || pc.connectionState === 'closed') return;
+    console.warn('[RTCPeerConnection] - Restarting ICE', { peer_id });
+    try {
+        // Make sure this side can send the renegotiation offer
+        handleRtcOffer(peer_id);
+        if (typeof pc.restartIce === 'function') {
+            pc.restartIce();
+        } else {
+            getPeerNegotiation(peer_id).iceRestart = true;
+            pc.dispatchEvent(new Event('negotiationneeded'));
+        }
+    } catch (err) {
+        console.error('[RTCPeerConnection] - restartIce error', err);
+    }
+}
+
+/**
+ * Per peer negotiation state used for perfect negotiation
+ * @param {string} peer_id socket.id
+ * @returns {object} state
+ */
+function getPeerNegotiation(peer_id) {
+    if (!peerNegotiation[peer_id]) {
+        peerNegotiation[peer_id] = { makingOffer: false, ignoreOffer: false, iceRestart: false };
+    }
+    return peerNegotiation[peer_id];
+}
+
+/**
+ * Make sure a connected peer always has a tile in the UI. If the remote track never
+ * arrived (or ontrack was missed) the participant would exist in the list but not be visible.
+ * When the track finally arrives, ontrack attaches the stream to the existing tile.
+ * @param {string} peer_id socket.id
+ * @param {number} delay ms
+ */
+function scheduleEnsurePeerTile(peer_id, delay = 0) {
+    clearTimeout(peerTileTimers[peer_id]);
+    peerTileTimers[peer_id] = setTimeout(() => {
+        delete peerTileTimers[peer_id];
+        if (!peerConnections[peer_id] || !allPeers?.[peer_id]) return;
+        if (getId(peer_id + '___video') || getId(peer_id + '___screen')) return;
+        console.warn('[PEER TILE] missing tile, creating fallback', { peer_id });
+        loadRemoteMediaStream(new MediaStream(), allPeers, peer_id, 'video').catch((err) =>
+            console.error('[PEER TILE] fallback failed', err)
+        );
+    }, delay);
 }
 
 /**
@@ -3288,8 +3377,12 @@ async function handleOnIceCandidate(peer_id) {
  */
 async function handleOnTrack(peer_id, peers) {
     peerConnections[peer_id].ontrack = (event) => {
-        if (!event.streams?.[0]) {
-            console.warn('[ON TRACK] No streams found', event);
+        // Peer was removed meanwhile; avoid creating a ghost tile
+        if (!peerConnections[peer_id]) return;
+
+        const inbound = event.streams?.[0] || (event.track ? new MediaStream([event.track]) : null);
+        if (!inbound) {
+            console.warn('[ON TRACK] No streams or tracks found', event);
             return;
         }
 
@@ -3301,7 +3394,6 @@ async function handleOnTrack(peer_id, peers) {
 
         const peerInfo = allPeers?.[peer_id] || peers?.[peer_id] || {};
         const peer_name = peerInfo.peer_name || 'Unknown';
-        const inbound = event.streams[0];
 
         // Helper to load or attach stream
         const handleStream = (elementId, streamType) => {
@@ -3491,30 +3583,32 @@ function blobToArrayBuffer(blob) {
  */
 async function handleRtcOffer(peer_id) {
     const pc = peerConnections[peer_id];
+    if (!pc) return;
+    const state = getPeerNegotiation(peer_id);
     // https://developer.mozilla.org/en-US/docs/Web/API/RTCPeerConnection/onnegotiationneeded
-    pc.onnegotiationneeded = () => {
-        console.log('Creating RTC offer to ' + allPeers[peer_id]['peer_name']);
-        // https://developer.mozilla.org/en-US/docs/Web/API/RTCPeerConnection/createOffer
-        pc.createOffer()
-            .then((local_description) => {
-                console.log('Local offer description is', local_description);
-                // https://developer.mozilla.org/en-US/docs/Web/API/RTCPeerConnection/setLocalDescription
-                pc.setLocalDescription(local_description)
-                    .then(() => {
-                        sendToServer('relaySDP', {
-                            peer_id: peer_id,
-                            session_description: local_description,
-                        });
-                        console.log('Offer setLocalDescription done!');
-                    })
-                    .catch((err) => {
-                        console.error('[Error] offer setLocalDescription', err);
-                        userLog('error', 'Offer setLocalDescription failed ' + err);
-                    });
-            })
-            .catch((err) => {
-                console.error('[Error] sending offer', err);
+    pc.onnegotiationneeded = async () => {
+        if (peerConnections[peer_id] !== pc) return;
+        console.log('Creating RTC offer to ' + (allPeers?.[peer_id]?.['peer_name'] || peer_id));
+        try {
+            state.makingOffer = true;
+            // https://developer.mozilla.org/en-US/docs/Web/API/RTCPeerConnection/createOffer
+            const local_description = await pc.createOffer(state.iceRestart ? { iceRestart: true } : undefined);
+            state.iceRestart = false;
+            // A remote offer may have been applied while we were creating ours
+            if (pc.signalingState !== 'stable') return;
+            console.log('Local offer description is', local_description);
+            // https://developer.mozilla.org/en-US/docs/Web/API/RTCPeerConnection/setLocalDescription
+            await pc.setLocalDescription(local_description);
+            sendToServer('relaySDP', {
+                peer_id: peer_id,
+                session_description: pc.localDescription || local_description,
             });
+            console.log('Offer setLocalDescription done!');
+        } catch (err) {
+            console.error('[Error] sending offer', err);
+        } finally {
+            state.makingOffer = false;
+        }
     };
 }
 
@@ -3523,12 +3617,9 @@ async function handleRtcOffer(peer_id) {
  * the 'offerer' sends a description to the 'answerer' (with type "offer"), then the answerer sends one back (with type "answer").
  * @param {object} config data
  */
-function handleSessionDescription(config) {
+async function handleSessionDescription(config) {
     console.log('Remote Session Description', config);
     const { peer_id, session_description } = config;
-
-    // https://developer.mozilla.org/en-US/docs/Web/API/RTCSessionDescription
-    const remote_description = new RTCSessionDescription(session_description);
 
     const pc = peerConnections[peer_id];
 
@@ -3537,51 +3628,52 @@ function handleSessionDescription(config) {
         return;
     }
 
-    // https://developer.mozilla.org/en-US/docs/Web/API/RTCPeerConnection/setRemoteDescription
-    pc.setRemoteDescription(remote_description)
-        .then(() => {
-            console.log('setRemoteDescription done!');
+    const state = getPeerNegotiation(peer_id);
+    const isOffer = session_description.type === 'offer';
 
-            // Drain any queued ICE now that remoteDescription is set.
-            flushIceCandidates(peer_id).catch((err) => console.error('[Error] flushIceCandidates', err));
+    // The peer with the lexicographically greater socket id is "polite": it rolls back its own offer on collision
+    const polite = String(myPeerId) > String(peer_id);
+    const offerCollision = isOffer && (state.makingOffer || pc.signalingState !== 'stable');
 
-            if (session_description.type == 'offer') {
-                console.log('Creating answer');
-                // https://developer.mozilla.org/en-US/docs/Web/API/RTCPeerConnection/createAnswer
-                pc.createAnswer()
-                    .then((local_description) => {
-                        console.log('Answer description is: ', local_description);
-                        // https://developer.mozilla.org/en-US/docs/Web/API/RTCPeerConnection/setLocalDescription
-                        pc.setLocalDescription(local_description)
-                            .then(() => {
-                                sendToServer('relaySDP', {
-                                    peer_id: peer_id,
-                                    session_description: local_description,
-                                });
-                                console.log('Answer setLocalDescription done!');
+    state.ignoreOffer = !polite && offerCollision;
+    if (state.ignoreOffer) {
+        console.log('[RTCSessionDescription] offer collision, impolite peer ignoring remote offer', { peer_id });
+        return;
+    }
 
-                                // https://github.com/miroslavpejic85/mirotalk/issues/110
-                                if (needToCreateOfferByPeer[peer_id]) {
-                                    needToCreateOfferByPeer[peer_id] = false;
-                                    handleRtcOffer(peer_id);
-                                    console.log('[RTCSessionDescription] - NEED TO CREATE OFFER', {
-                                        peer_id: peer_id,
-                                    });
-                                }
-                            })
-                            .catch((err) => {
-                                console.error('[Error] answer setLocalDescription', err);
-                                userLog('error', 'Answer setLocalDescription failed ' + err);
-                            });
-                    })
-                    .catch((err) => {
-                        console.error('[Error] creating answer', err);
-                    });
-            } // end [if type offer]
-        })
-        .catch((err) => {
-            console.error('[Error] setRemoteDescription', err);
-        });
+    try {
+        // On collision (polite) setRemoteDescription implicitly rolls back our pending local offer
+        await pc.setRemoteDescription(new RTCSessionDescription(session_description));
+        console.log('setRemoteDescription done!');
+
+        // The connection may have been closed/replaced while awaiting
+        if (peerConnections[peer_id] !== pc) return;
+
+        // Drain any queued ICE now that remoteDescription is set.
+        await flushIceCandidates(peer_id).catch((err) => console.error('[Error] flushIceCandidates', err));
+
+        if (isOffer) {
+            console.log('Creating answer');
+            const local_description = await pc.createAnswer();
+            await pc.setLocalDescription(local_description);
+            sendToServer('relaySDP', {
+                peer_id: peer_id,
+                session_description: pc.localDescription || local_description,
+            });
+            console.log('Answer setLocalDescription done!');
+
+            // https://github.com/miroslavpejic85/mirotalk/issues/110
+            if (needToCreateOfferByPeer[peer_id]) {
+                needToCreateOfferByPeer[peer_id] = false;
+                handleRtcOffer(peer_id);
+                console.log('[RTCSessionDescription] - NEED TO CREATE OFFER', {
+                    peer_id: peer_id,
+                });
+            }
+        }
+    } catch (err) {
+        console.error('[Error] handleSessionDescription', err);
+    }
 }
 
 /**
@@ -3606,6 +3698,7 @@ function handleIceCandidate(config) {
     }
 
     pc.addIceCandidate(new RTCIceCandidate(ice_candidate)).catch((err) => {
+        if (peerNegotiation[peer_id]?.ignoreOffer) return;
         console.error('[Error] addIceCandidate', err);
     });
 }
@@ -3709,9 +3802,22 @@ function handleDisconnect(reason) {
     fileDataChannels = {};
     peerConnections = {};
     pendingIceCandidates = {};
+    Object.values(peerAudioMediaElements).forEach((wrap) => {
+        const audioEl = wrap?.querySelector('audio');
+        if (audioEl && audioEl._audioWatchdog) {
+            clearInterval(audioEl._audioWatchdog);
+            audioEl._audioWatchdog = null;
+        }
+    });
     peerScreenMediaElements = {};
     peerVideoMediaElements = {};
     peerAudioMediaElements = {};
+    needToCreateOfferByPeer = {};
+    peerNegotiation = {};
+    Object.values(peerDisconnectTimers).forEach(clearTimeout);
+    Object.values(peerTileTimers).forEach(clearTimeout);
+    peerDisconnectTimers = {};
+    peerTileTimers = {};
 
     // Set reconnection flag to trigger proper rejoin
     isPeerReconnected = true;
@@ -3745,7 +3851,7 @@ function handleRemovePeer(config) {
                 }
             }
         }
-        peerVideoMediaElements[peerVideoId].parentNode.removeChild(peerVideoMediaElements[peerVideoId]);
+        peerVideoMediaElements[peerVideoId]?.parentNode?.removeChild(peerVideoMediaElements[peerVideoId]);
         adaptAspectRatio();
     }
 
@@ -3765,15 +3871,40 @@ function handleRemovePeer(config) {
                 }
             }
         }
-        peerScreenMediaElements[peerScreenId].parentNode.removeChild(peerScreenMediaElements[peerScreenId]);
+        peerScreenMediaElements[peerScreenId]?.parentNode?.removeChild(peerScreenMediaElements[peerScreenId]);
         adaptAspectRatio();
     }
 
     if (peerAudioId in peerAudioMediaElements) {
-        peerAudioMediaElements[peerAudioId].parentNode.removeChild(peerAudioMediaElements[peerAudioId]);
+        const audioWrap = peerAudioMediaElements[peerAudioId];
+        const audioEl = audioWrap?.querySelector('audio');
+        if (audioEl && audioEl._audioWatchdog) {
+            clearInterval(audioEl._audioWatchdog);
+            audioEl._audioWatchdog = null;
+        }
+        audioWrap?.parentNode?.removeChild(audioWrap);
     }
 
+    // Fallback: remove any orphan tiles that were not tracked in the media element maps
+    [peerVideoId, peerScreenId, peerAudioId].forEach((id) => {
+        const el = getId(id);
+        if (!el) return;
+        if (el._audioWatchdog) {
+            clearInterval(el._audioWatchdog);
+            el._audioWatchdog = null;
+        }
+        const wrap = el.closest('.Camera') || el;
+        wrap.parentNode?.removeChild(wrap);
+    });
+
     if (peer_id in peerConnections) peerConnections[peer_id].close();
+
+    clearTimeout(peerDisconnectTimers[peer_id]);
+    clearTimeout(peerTileTimers[peer_id]);
+    delete peerDisconnectTimers[peer_id];
+    delete peerTileTimers[peer_id];
+    delete peerNegotiation[peer_id];
+    delete needToCreateOfferByPeer[peer_id];
 
     // Clean up dropdown menus appended to body
     const dropdownBtn = getId(peer_id + '_videoDropdownBtn');
@@ -3784,6 +3915,9 @@ function handleRemovePeer(config) {
     msgerRemovePeer(peer_id);
     removeVideoPinMediaContainer(peer_id);
 
+    // Read the name before deleting the peer data
+    const peer_name = allPeers && allPeers[peer_id] ? allPeers[peer_id]['peer_name'] : 'Participant';
+
     delete chatDataChannels[peer_id];
     delete fileDataChannels[peer_id];
     delete peerConnections[peer_id];
@@ -3793,10 +3927,10 @@ function handleRemovePeer(config) {
     delete peerAudioMediaElements[peerAudioId];
     delete allPeers[peer_id];
 
+    adaptAspectRatio();
     playSound('removePeer');
 
     // Screen reader announcement for peer left
-    const peer_name = allPeers && allPeers[peer_id] ? allPeers[peer_id]['peer_name'] : 'Participant';
     screenReaderAccessibility.announceMessage(`${peer_name} left the room`);
 
     console.log('ALL PEERS', allPeers);
@@ -5680,6 +5814,43 @@ async function loadRemoteMediaStream(stream, peers, peer_id, kind) {
             attachMediaStream(remoteAudioMedia, stream);
             peerAudioMediaElements[remoteAudioMedia.id] = remoteAudioWrap;
             applyOutputVolume(remoteAudioMedia);
+
+            // Resilient audio playback watchdog and event handlers
+            const ensureAudioPlaying = () => {
+                if (remoteAudioMedia.paused && remoteAudioMedia.srcObject && !remoteAudioMedia.muted) {
+                    remoteAudioMedia.play().catch((err) => {
+                        console.warn('[AUDIO] Auto-resume failed for ' + peer_name, err);
+                    });
+                }
+            };
+
+            remoteAudioMedia.onpause = () => {
+                ensureAudioPlaying();
+            };
+            remoteAudioMedia.onstalled = () => {
+                ensureAudioPlaying();
+            };
+            remoteAudioMedia.onwaiting = () => {
+                ensureAudioPlaying();
+            };
+
+            const remoteAudioTracks = stream.getAudioTracks();
+            if (remoteAudioTracks.length > 0) {
+                const track = remoteAudioTracks[0];
+                track.onunmute = () => {
+                    console.log('[AUDIO] Track unmuted for ' + peer_name + ', ensuring playback');
+                    ensureAudioPlaying();
+                };
+            }
+
+            const audioWatchdog = setInterval(() => {
+                if (!document.body.contains(remoteAudioMedia)) {
+                    clearInterval(audioWatchdog);
+                    return;
+                }
+                ensureAudioPlaying();
+            }, 5000);
+            remoteAudioMedia._audioWatchdog = audioWatchdog;
 
             // Explicitly play audio to ensure it starts (handles autoplay policies)
             remoteAudioMedia.play().catch((err) => {
@@ -10119,11 +10290,18 @@ async function stopScreenSharing(init) {
         }
         myScreenWrap.remove();
     }
+    const activeMicTrack = getAudioTrack(localAudioMediaStream);
     if (localScreenMediaStream) {
-        localScreenMediaStream.getTracks().forEach((t) => t.stop());
+        localScreenMediaStream.getTracks().forEach((t) => {
+            if (activeMicTrack && t.id === activeMicTrack.id) return;
+            t.stop();
+        });
     }
     if (localScreenDisplayStream) {
-        localScreenDisplayStream.getTracks().forEach((t) => t.stop());
+        localScreenDisplayStream.getTracks().forEach((t) => {
+            if (activeMicTrack && t.id === activeMicTrack.id) return;
+            t.stop();
+        });
     }
     localScreenDisplayStream = null;
     if (screenShareAudioContext) {
@@ -17223,7 +17401,7 @@ function sendFileData(peer_id, broadcast) {
             if (fileDataChannels[peer_id].bufferedAmount > fileDataChannels[peer_id].bufferedAmountLowThreshold) {
                 fileDataChannels[peer_id].onbufferedamountlow = () => {
                     fileDataChannels[peer_id].onbufferedamountlow = null;
-                    readSlice(0);
+                    readSlice(o);
                 };
                 return;
             }

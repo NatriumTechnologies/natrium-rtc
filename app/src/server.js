@@ -1441,6 +1441,23 @@ io.sockets.on('connect', async (socket) => {
      * On peer join
      */
     socket.on('join', async (cfg) => {
+        // The join flow has several async gaps (geo lookup, token validation, addPeer emits).
+        // A duplicate join arriving in between used to pass the "already joined" check and
+        // produce duplicate addPeer events / inconsistent peers.
+        if (socket.joinInProgress) {
+            return log.debug('[' + socket.id + '] [Warning] join already in progress');
+        }
+        socket.joinInProgress = true;
+        try {
+            await handleJoin(cfg);
+        } catch (err) {
+            log.error('[' + socket.id + '] Join error', err.message);
+        } finally {
+            socket.joinInProgress = false;
+        }
+    });
+
+    const handleJoin = async (cfg) => {
         // Get peer IPv4 (::1 Its the loopback address in ipv6, equal to 127.0.0.1 in ipv4)
         const peer_ip = getSocketIP(socket);
 
@@ -1684,7 +1701,7 @@ io.sockets.on('connect', async (socket) => {
                 .then((response) => log.debug('Join event tracked:', response.data))
                 .catch((error) => log.error('Error tracking join event:', error.message));
         }
-    });
+    };
 
     /**
      * Relay ICE to peers

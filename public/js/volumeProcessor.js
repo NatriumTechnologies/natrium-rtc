@@ -4,7 +4,7 @@ class VolumeProcessor extends AudioWorkletProcessor {
         super();
         this.threshold = options.processorOptions.threshold || 10;
         this.peerId = options.processorOptions.peerId || '';
-        this.silenceThreshold = options.processorOptions.silenceThreshold || 0.01;
+        this.lastSendTime = 0;
     }
 
     process(inputs, outputs, parameters) {
@@ -31,21 +31,26 @@ class VolumeProcessor extends AudioWorkletProcessor {
         const volume = Math.max(0, Math.min(1, rms * 10));
         const finalVolume = Math.round(volume * 100);
 
-        // Only send data when volume exceeds threshold
-        if (finalVolume > this.threshold) {
-            this.port.postMessage({
-                type: 'micVolume',
-                peer_id: this.peerId,
-                volume: finalVolume,
-            });
-        }
+        const now = currentTime;
+        if (now - this.lastSendTime >= 0.05) {
+            this.lastSendTime = now;
 
-        // Send volume data for UI updates
-        if (volume > this.silenceThreshold) {
-            this.port.postMessage({
-                type: 'volumeIndicator',
-                volume: volume,
-            });
+            // Only send data when volume exceeds threshold
+            if (finalVolume > this.threshold) {
+                this.port.postMessage({
+                    type: 'micVolume',
+                    peer_id: this.peerId,
+                    volume: finalVolume,
+                });
+            }
+
+            // Send volume data for UI updates
+            if (volume > this.silenceThreshold) {
+                this.port.postMessage({
+                    type: 'volumeIndicator',
+                    volume: volume,
+                });
+            }
         }
 
         return true;

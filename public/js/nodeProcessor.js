@@ -202,6 +202,12 @@ class RNNoiseProcessor {
             if (this.audioContext !== audioContext) return null;
             if (audioContext.state !== 'running') throw new Error('Audio context is not running');
 
+            audioContext.onstatechange = () => {
+                if (audioContext.state === 'suspended' && this.isProcessing) {
+                    audioContext.resume().catch(() => {});
+                }
+            };
+
             this.mediaStream = mediaStream;
             if (!this.mediaStream.getAudioTracks().length) {
                 throw new Error('No audio tracks found in the provided media stream');

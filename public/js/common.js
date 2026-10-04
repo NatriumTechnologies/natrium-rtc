@@ -307,3 +307,25 @@ console.log('Allow Camera or Audio', {
     message: message,
 });
 if (showMessage) showMessage.innerHTML = message;
+
+/**
+ * Common DOM Selectors
+ */
+function getId(id) {
+    return document.getElementById(id);
+}
+function getQs(selectors) {
+    return document.querySelector(selectors);
+}
+function getQsA(selectors) {
+    return document.querySelectorAll(selectors);
+}
+function getEcN(className) {
+    return document.getElementsByClassName(className);
+}
+if (typeof window !== 'undefined') {
+    window.getId = getId;
+    window.getQs = getQs;
+    window.getQsA = getQsA;
+    window.getEcN = getEcN;
+}

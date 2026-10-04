@@ -59,12 +59,17 @@ function Area(Increment, Count, Width, Height, Margin = 10) {
  * Resize video elements
  */
 function resizeVideoMedia() {
-    if (isHideALLVideosActive) return;
+    if (typeof isHideALLVideosActive !== 'undefined' && isHideALLVideosActive) return;
 
-    const videoMediaContainer = getId('videoMediaContainer');
+    const getElById = typeof getId === 'function' ? getId : (id) => document.getElementById(id);
+    const getElByClass = typeof getEcN === 'function' ? getEcN : (cls) => document.getElementsByClassName(cls);
+
+    const videoMediaContainer = getElById('videoMediaContainer');
+    if (!videoMediaContainer) return;
+
     // Include both Camera and Screen tiles in layout sizing
-    const Cameras = getEcN('Camera');
-    const Screens = getEcN('Screen');
+    const Cameras = getElByClass('Camera');
+    const Screens = getElByClass('Screen');
     const Tiles = [...Cameras, ...Screens];
 
     const Margin = 5;

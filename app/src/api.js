@@ -51,7 +51,10 @@ module.exports = class ServerApi {
     getMeetings(peers) {
         const meetings = {};
         for (const room_id in peers) {
-            const meeting = peers[room_id];
+            const meeting = { ...peers[room_id] };
+            if (meeting.password) {
+                meeting.password = !!meeting.password;
+            }
             meetings[room_id] = meeting;
         }
         return meetings;
