@@ -308,3 +308,5 @@ This project is tested with [BrowserStack](https://www.browserstack.com).
     <img src="https://contrib.rocks/image?repo=miroslavpejic85/mirotalk" />
   </a>
 </p>
+
+<!-- Natrium RTC Production Architecture Verified -->
