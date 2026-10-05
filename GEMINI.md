@@ -13,13 +13,13 @@ The RTC system is organized into a single parent folder (`/root/projects/rtc/`) 
 ├── rtc_main/              # PRODUCTION environment (Port 3000 -> https://rtc.natrium.sh)
 │   ├── app/src/           # Server-side signaling, REST API, WebSocket handlers
 │   ├── public/            # Client frontend assets (HTML, CSS, WebRTC client JS)
-│   ├── tests/             # Automated test suite (400 test cases)
+│   ├── tests/             # Automated test suite (407 test cases)
 │   └── .env               # Production environment configuration (PORT=3000)
 │
 ├── rtc_stage/             # STAGING environment (Port 3001 -> https://stage-rtc.natrium.sh)
 │   ├── app/src/           # Server-side signaling
 │   ├── public/            # Client frontend assets (with [STAGE] tab title indicator)
-│   ├── tests/             # Automated test suite
+│   ├── tests/             # Automated test suite (407 test cases)
 │   └── .env               # Staging environment configuration (PORT=3001)
 │
 ├── ecosystem.config.cjs   # Unified PM2 process configuration for both environments
@@ -65,22 +65,48 @@ rtc restart all
 rtc logs stage
 rtc logs prod
 
-# Run the 400 automated unit tests in staging
+# Run all 407 automated unit tests in staging
 rtc test
 
-# Safely promote tested code from staging to production (prompts for confirmation or use -y)
-rtc promote -y
+# Safely promote tested code from staging to production with descriptive commit message
+rtc promote "<type>(<scope>): <descriptive message>"
 ```
 
 ### How `rtc promote` Works (Safe Zero-Downtime Deployment)
-1. **Automated Verification**: Runs `npm test` inside `rtc_stage`. If any test fails, promotion **halts immediately**.
-2. **Commit & Sync**: Commits any unstaged work in `rtc_stage` and pulls it directly into `rtc_main`.
-3. **Graceful Reload**: Triggers `pm2 reload rtc-prod` to load new code with zero dropped connections.
-4. **Health Check**: Executes a live HTTP request to port `3000`. Verifies `HTTP 200 OK` before confirming success.
+1. **Automated Verification**: Runs `npm test` inside `rtc_stage`. If any of the 407 tests fail, promotion **halts immediately**.
+2. **Commit Validation**: Ensures any unstaged or new work in `rtc_stage` is committed using a meaningful, change-specific commit message (generic messages like `stage: update promoted to prod at...` are strictly rejected).
+3. **Sync to Production**: Pulls verified commits directly from `rtc_stage` into `rtc_main`.
+4. **Graceful Reload**: Triggers `pm2 reload rtc-prod` to reload production workers with zero dropped connections.
+5. **Health Check**: Executes a live HTTP request to port `3000`. Verifies `HTTP 200 OK` before confirming success.
+6. **GitHub Synchronization**: Automatically pushes verified branches to GitHub remote (`origin/stage` and `origin/main`).
 
 ---
 
-## 3. Critical WebRTC & Engineering Rules
+## 3. Commit Message Standards (Conventional Commits)
+
+> [!IMPORTANT]
+> **Mandatory Semantic Commit Messages**:
+> All commits must follow the **Conventional Commits** specification. Generic messages like `"stage: update promoted to prod at..."` or `"update"` are **STRICTLY PROHIBITED**.
+>
+> Format:
+> ```
+> <type>(<scope>): <short description>
+>
+> [optional longer body explaining context, changes, and rationale]
+> ```
+>
+> Acceptable Types:
+> - `feat`: A new feature (e.g. `feat(audio): separate screen share stream volume from participant voice volume`)
+> - `fix`: A bug fix (e.g. `fix(client): decouple participant count from screen tiles`)
+> - `test`: Adding or updating tests (e.g. `test(volume): add unit tests for stream volume separation`)
+> - `docs`: Documentation changes (e.g. `docs: update GEMINI.md commit guidelines`)
+> - `refactor`: Code restructuring without behavioral changes (e.g. `refactor(audio): clean up volume change handlers`)
+> - `perf`: Performance improvements (e.g. `perf(datachannel): throttle SCTP messages to 20Hz`)
+> - `chore`: Build scripts, dependencies, or configuration updates (e.g. `chore(cli): add commit validation to rtc CLI`)
+
+---
+
+## 4. Critical WebRTC & Engineering Rules
 
 > [!CAUTION]
 > **Audio Container Rendering (Do NOT use `display: none`)**:
@@ -100,7 +126,7 @@ rtc promote -y
 
 > [!IMPORTANT]
 > **Cloudflare Rocket Loader Compatibility**:
-> In [`public/views/client.html`](file:///root/projects/rtc/rtc_main/public/views/client.html), all application `<script>` tags MUST include `data-cfasync="false"`:
+> In [`public/views/client.html`](file:///root/projects/rtc/rtc_main/public/views/client.html) and all other views, all application `<script>` tags MUST include `data-cfasync="false"`:
 > ```html
 > <script data-cfasync="false" defer src="../js/client.js"></script>
 > ```
@@ -118,9 +144,13 @@ rtc promote -y
 > **Credential & Password Sanitization**:
 > Never broadcast plaintext room passwords or private credentials over signaling channels or API responses. In [`app/src/server.js`](file:///root/projects/rtc/rtc_main/app/src/server.js), `getSanitizedPeers` strips password fields, and [`app/src/api.js`](file:///root/projects/rtc/rtc_main/app/src/api.js) masks meeting secrets.
 
+> [!IMPORTANT]
+> **Independent Screen Audio Routing & Controls**:
+> Screen share audio and microphone voice tracks must travel over distinct `RTCRtpSender` channels (`_mediaType = 'mic'` and `_mediaType = 'screen_audio'`) and play through separate HTML elements (`<audio id="${peer_id}">` for voice, and `<audio id="${peer_id}___screen_audio">` for screen). This ensures participant voice and screen stream volume can be adjusted, muted, and recovered independently.
+
 ---
 
-## 4. Developer & AI Agent Workflow
+## 5. Developer & AI Agent Workflow
 
 > [!CAUTION]
 > **Mandatory User Approval Before Promoting to Main (Production)**:
@@ -136,24 +166,27 @@ When making any code changes, bug fixes, or enhancements:
    - Run tests: `npm test` (or `rtc test`)
    - Test in browser: [https://stage-rtc.natrium.sh](https://stage-rtc.natrium.sh)
    - Inspect stage logs: `rtc logs stage`
-3. **Verify Zero Regressions**:
-   - Ensure all 400 test cases pass.
+3. **Commit with Meaningful Semantic Messages**:
+   - Commit changes using Conventional Commits: `git commit -m "feat(scope): descriptive message"`
+   - Never use generic commit messages.
+4. **Verify Zero Regressions**:
+   - Ensure all 407 test cases pass (`rtc test`).
    - Verify audio, video, and screen sharing connect cleanly.
-4. **Always Ask the User for Approval to Promote**:
-   - Report to the user that changes in staging are completed, verified, and passing tests.
-   - Ask explicitly: *"Staging is verified and all 400 unit tests pass. Would you like me to promote this to production (main)?"*
+5. **Always Ask the User for Approval to Promote**:
+   - Report to the user that changes in staging are completed, tested, and passing all 407 tests.
+   - Ask explicitly: *"Staging is verified and all 407 unit tests pass. Would you like me to promote this to production (main)?"*
    - Stop and wait for the user's response. **NEVER proceed with promotion without user approval.**
-5. **Promote to Production (Only After Explicit Approval)**:
+6. **Promote to Production (Only After Explicit Approval)**:
    ```bash
-   rtc promote -y
+   rtc promote "feat(scope): descriptive message"
    ```
-6. **Verify Production**:
+7. **Verify Production**:
    - Check [https://rtc.natrium.sh](https://rtc.natrium.sh)
    - Run `rtc status` to ensure both services remain green.
 
 ---
 
-## 5. Reverse Proxy & Cloudflare Networking
+## 6. Reverse Proxy & Cloudflare Networking
 
 - Both domains resolve to Cloudflare Anycast IPs (`172.67.171.239`, `104.21.88.14`).
 - Cloudflare terminates TLS on port 443 and applies **Origin Rules** to route traffic to the VPS (`45.141.116.81`):
