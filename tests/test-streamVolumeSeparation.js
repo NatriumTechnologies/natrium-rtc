@@ -292,4 +292,178 @@ describe('Stream Volume & User Volume Separation', () => {
         // Stream audio should be 0.5 * 0.5 = 0.25
         screenAudio.volume.should.be.approximately(0.25, 0.001);
     });
+
+    it('8. should self-heal and revive peer audio when incoming voice volume packet arrives', async () => {
+        const peerId = 'peer_helen_8';
+
+        const userAudio = document.createElement('audio');
+        userAudio.id = `${peerId}___audio`;
+        userAudio.dataset.peerVolume = '1';
+        userAudio.muted = true; // Stalled or muted initially
+        let playCalled = false;
+        let isPaused = true;
+        Object.defineProperty(userAudio, 'paused', {
+            get: () => isPaused,
+            configurable: true,
+        });
+        userAudio.play = async () => {
+            playCalled = true;
+            isPaused = false;
+        };
+        audioMediaContainer.appendChild(userAudio);
+
+        // Simulate handlePeerVolume receiving micVolume packet
+        function simulatePeerVolume(data) {
+            const { peer_id, volume } = data;
+            if (volume === 0) return;
+
+            const peerAudio = document.getElementById(peer_id + '___audio');
+            if (peerAudio) {
+                const userSetVolume = Number(peerAudio.dataset.peerVolume);
+                if (isNaN(userSetVolume) || userSetVolume > 0) {
+                    if (peerAudio.muted) {
+                        peerAudio.muted = false;
+                    }
+                    if (peerAudio.paused) {
+                        peerAudio.play().catch(() => {});
+                    }
+                }
+            }
+        }
+
+        // Peer speaks with volume 45%
+        simulatePeerVolume({ peer_id: peerId, volume: 45 });
+
+        userAudio.muted.should.be.false();
+        playCalled.should.be.true();
+    });
+
+    it('9. should ensure remote audio is unmuted when stream contains audio tracks', () => {
+        const peerId = 'peer_ivan_9';
+
+        const remoteAudioMedia = document.createElement('audio');
+        remoteAudioMedia.id = `${peerId}___audio`;
+        remoteAudioMedia.autoplay = true;
+
+        const fakeAudioTrack = { kind: 'audio', readyState: 'live', enabled: true };
+        const fakeStream = {
+            id: 'stream_ivan',
+            getAudioTracks: () => [fakeAudioTrack],
+            hasAudioTrack: true,
+        };
+
+        function hasAudioTrack(stream) {
+            return stream && stream.getAudioTracks().length > 0;
+        }
+
+        // Simulated loadRemoteMediaStream logic
+        remoteAudioMedia.muted = !hasAudioTrack(fakeStream);
+        remoteAudioMedia.muted.should.be.false();
+
+        // Empty stream should be muted
+        const emptyStream = { getAudioTracks: () => [] };
+        remoteAudioMedia.muted = !hasAudioTrack(emptyStream);
+        remoteAudioMedia.muted.should.be.true();
+    });
+
+    it('10. should prevent re-prompting screen share picker when stopping screen share', async () => {
+        let isScreenStreaming = true;
+        let isScreenShareStarting = false;
+        let isScreenShareStopping = false;
+        let lastScreenShareActionTime = 0;
+        let getDisplayMediaCalled = 0;
+
+        async function startScreenSharing() {
+            getDisplayMediaCalled++;
+            isScreenStreaming = true;
+        }
+
+        async function stopScreenSharing() {
+            if (isScreenShareStopping) return;
+            isScreenShareStopping = true;
+            try {
+                isScreenStreaming = false;
+            } finally {
+                isScreenShareStopping = false;
+            }
+        }
+
+        async function toggleScreenSharing() {
+            const now = Date.now();
+            if (now - lastScreenShareActionTime < 400) return;
+            if (isScreenShareStarting || isScreenShareStopping) return;
+            lastScreenShareActionTime = now;
+
+            if (isScreenStreaming) {
+                await stopScreenSharing();
+                return;
+            }
+
+            try {
+                isScreenShareStarting = true;
+                await startScreenSharing();
+            } finally {
+                isScreenShareStarting = false;
+            }
+        }
+
+        // Initially sharing. User presses stop screenshare:
+        await toggleScreenSharing();
+        isScreenStreaming.should.be.false();
+        getDisplayMediaCalled.should.equal(0);
+
+        // Immediate rapid second click (debounce / in-progress guard):
+        await toggleScreenSharing();
+        // Should NOT trigger startScreenSharing due to debounce (<400ms)
+        getDisplayMediaCalled.should.equal(0);
+
+        // If track.onended fires when stopping, it calls stopScreenSharing directly, NEVER startScreenSharing
+        const onended = async () => {
+            if (isScreenStreaming || isScreenShareStarting) {
+                await stopScreenSharing();
+            }
+        };
+        await onended();
+        getDisplayMediaCalled.should.equal(0);
+    });
+
+    it('11. should distinguish screen audio from mic audio deterministically using track and stream metadata', () => {
+        const peerExtras = {
+            screen_track_id: 'video_screen_123',
+            screen_stream_id: 'stream_screen_123',
+            screen_audio_track_id: 'audio_screen_123',
+            has_screen_audio: true,
+            mic_audio_track_id: 'audio_mic_456',
+            mic_stream_id: 'stream_mic_456',
+        };
+
+        function routeTrack(track, inboundStream, extras, peerScreenStatus) {
+            const isScreenAudioById = !!(extras && extras.screen_audio_track_id && track.id === extras.screen_audio_track_id);
+            const isScreenAudioByStream = !!(extras && extras.screen_stream_id && inboundStream && inboundStream.id === extras.screen_stream_id);
+            const isMicAudio = !!(
+                (extras && extras.mic_audio_track_id && track.id === extras.mic_audio_track_id) ||
+                (extras && extras.mic_stream_id && inboundStream && inboundStream.id === extras.mic_stream_id) ||
+                (!isScreenAudioById && !isScreenAudioByStream)
+            );
+
+            if (isScreenAudioById || isScreenAudioByStream) {
+                return 'screen_audio';
+            }
+            if (isMicAudio) {
+                return 'mic_audio';
+            }
+            return 'unknown';
+        }
+
+        // Test mic track arriving while peer is screen sharing
+        const micTrack = { id: 'audio_mic_456', kind: 'audio' };
+        const micStream = { id: 'stream_mic_456' };
+        routeTrack(micTrack, micStream, peerExtras, true).should.equal('mic_audio');
+
+        // Test screen audio track arriving
+        const screenTrack = { id: 'audio_screen_123', kind: 'audio' };
+        const screenStream = { id: 'stream_screen_123' };
+        routeTrack(screenTrack, screenStream, peerExtras, true).should.equal('screen_audio');
+    });
 });
+

@@ -690,6 +690,8 @@ let localVideoMediaStream; // my webcam
 let localScreenMediaStream; // my screen share
 let localScreenDisplayStream; // raw getDisplayMedia stream (may include audio)
 let isScreenShareStarting = false; // guard to prevent duplicate concurrent screen share dialogs
+let isScreenShareStopping = false; // guard to prevent duplicate concurrent screen share stop actions
+let lastScreenShareActionTime = 0; // timestamp debounce for screen share button clicks
 let screenShareAudioContext; // AudioContext used to mix screen audio + microphone
 let localAudioMediaStream; // my microphone
 let noiseProcessor = null; // RNNoise audio processing
@@ -3417,21 +3419,34 @@ async function handleOnTrack(peer_id, peers) {
             const screenElement = getId(`${peer_id}___screen`);
             const existingAudioElement = getId(`${peer_id}___audio`);
 
-            const isScreenAudioByTrack = extras.screen_audio_track_id && extras.screen_audio_track_id === event.track?.id;
-            const isScreenAudioByStream = extras.screen_stream_id && extras.screen_stream_id === inbound.id;
-            const isScreenAudioByVideo = screenElement?.srcObject && screenElement.srcObject.id === inbound.id;
-            const isScreenAudioByInbound = inbound.getVideoTracks?.().length > 0;
-            const isScreenAudioByDiff =
-                peerInfo.peer_screen_status &&
-                existingAudioElement?.srcObject &&
-                existingAudioElement.srcObject.id !== inbound.id;
+            // Explicit mic identification
+            const isExplicitMicByTrack = extras.mic_audio_track_id && extras.mic_audio_track_id === event.track?.id;
+            const isExplicitMicByStream = extras.mic_stream_id && extras.mic_stream_id === inbound.id;
+            const isExplicitMic = isExplicitMicByTrack || isExplicitMicByStream;
 
-            const isScreenAudio =
-                isScreenAudioByTrack ||
-                isScreenAudioByStream ||
-                isScreenAudioByVideo ||
-                isScreenAudioByInbound ||
-                isScreenAudioByDiff;
+            // Explicit screen audio identification
+            const isExplicitScreenByTrack =
+                extras.screen_audio_track_id && extras.screen_audio_track_id === event.track?.id;
+            const isExplicitScreenByStream = extras.screen_stream_id && extras.screen_stream_id === inbound.id;
+            const isExplicitScreenByVideo = screenElement?.srcObject && screenElement.srcObject.id === inbound.id;
+            const isExplicitScreenByInbound = inbound.getVideoTracks?.().length > 0;
+
+            let isScreenAudio = false;
+
+            if (isExplicitMic) {
+                isScreenAudio = false;
+            } else if (
+                isExplicitScreenByTrack ||
+                isExplicitScreenByStream ||
+                isExplicitScreenByVideo ||
+                isExplicitScreenByInbound
+            ) {
+                isScreenAudio = true;
+            } else if (peerInfo.peer_screen_status && extras.has_screen_audio) {
+                if (existingAudioElement?.srcObject && existingAudioElement.srcObject.id !== inbound.id) {
+                    isScreenAudio = true;
+                }
+            }
 
             if (isScreenAudio) {
                 console.log('[ON TRACK] Detected screen audio track for', peer_id);
@@ -3439,11 +3454,20 @@ async function handleOnTrack(peer_id, peers) {
                 return;
             }
 
+            console.log('[ON TRACK] Detected participant voice audio track for', peer_id);
             const audioElement = getId(`${peer_id}___audio`);
 
             if (audioElement) {
+                audioElement.muted = false;
                 attachMediaStream(audioElement, inbound);
-                // Always call play() — srcObject was just assigned so the old check (!srcObject) was always false
+                applyOutputVolume(audioElement);
+                if (inbound.getAudioTracks().length > 0) {
+                    inbound.getAudioTracks()[0].onunmute = () => {
+                        console.log('[AUDIO] Track unmuted for ' + peer_name + ', ensuring playback');
+                        audioElement.muted = false;
+                        if (audioElement.paused) audioElement.play().catch(() => {});
+                    };
+                }
                 audioElement.play().catch((err) => {
                     console.warn('[AUDIO] Autoplay not allowed by device, setting up fallback:', err);
                     handleAudioFallback(audioElement, peer_name);
@@ -3513,13 +3537,19 @@ async function handleAddTracks(peer_id) {
     if (micAudioTrack) {
         console.log('[ADD MIC AUDIO TRACK] to Peer Name [' + peer_name + ']');
         const s = await pc.addTrack(micAudioTrack, localAudioMediaStream);
-        if (s) s._mediaType = 'mic';
+        if (s) {
+            s._mediaType = 'mic';
+            pc._micSender = s;
+        }
     }
 
     if (screenAudioTrack) {
         console.log('[ADD SCREEN AUDIO TRACK] to Peer Name [' + peer_name + ']');
         const s = await pc.addTrack(screenAudioTrack, localScreenMediaStream);
-        if (s) s._mediaType = 'screen_audio';
+        if (s) {
+            s._mediaType = 'screen_audio';
+            pc._screenAudioSender = s;
+        }
     }
 }
 
@@ -5581,6 +5611,14 @@ async function loadRemoteMediaStream(stream, peers, peer_id, kind) {
             setPeerVideoStatus(peer_id, peer_video_status);
             // refresh remote peers audio icon status and title
             setPeerAudioStatus(peer_id, peer_audio_status);
+            const existingAudio = getId(peer_id + '___audio');
+            if (existingAudio && !isMobileDevice) {
+                try {
+                    handleAudioVolume(remoteAudioVolume.id, existingAudio.id);
+                } catch (e) {
+                    console.warn('[AUDIO] Initial handleAudioVolume failed in video setup', e);
+                }
+            }
             // handle remote peers audio on-off
             handlePeerAudioBtn(peer_id);
             // handle remote peers video on-off
@@ -5917,6 +5955,8 @@ async function loadRemoteMediaStream(stream, peers, peer_id, kind) {
 
             if (!hasAudioTrack(stream)) {
                 remoteAudioMedia.muted = true;
+            } else {
+                remoteAudioMedia.muted = false;
             }
 
             remoteAudioWrap.appendChild(remoteAudioMedia);
@@ -5927,6 +5967,9 @@ async function loadRemoteMediaStream(stream, peers, peer_id, kind) {
 
             // Resilient audio playback watchdog and event handlers
             const ensureAudioPlaying = () => {
+                if (hasAudioTrack(remoteAudioMedia.srcObject) && remoteAudioMedia.muted) {
+                    remoteAudioMedia.muted = false;
+                }
                 if (remoteAudioMedia.paused && remoteAudioMedia.srcObject && !remoteAudioMedia.muted) {
                     remoteAudioMedia.play().catch((err) => {
                         console.warn('[AUDIO] Auto-resume failed for ' + peer_name, err);
@@ -5949,6 +5992,7 @@ async function loadRemoteMediaStream(stream, peers, peer_id, kind) {
                 const track = remoteAudioTracks[0];
                 track.onunmute = () => {
                     console.log('[AUDIO] Track unmuted for ' + peer_name + ', ensuring playback');
+                    remoteAudioMedia.muted = false;
                     ensureAudioPlaying();
                 };
             }
@@ -6021,6 +6065,9 @@ function handleRemoteScreenAudio(stream, peer_id, peer_name) {
 
         // Resilient audio playback watchdog and event handlers
         const ensureScreenAudioPlaying = () => {
+            if (hasAudioTrack(screenAudioMedia.srcObject) && screenAudioMedia.muted) {
+                screenAudioMedia.muted = false;
+            }
             if (screenAudioMedia.paused && screenAudioMedia.srcObject && !screenAudioMedia.muted) {
                 screenAudioMedia.play().catch((err) => {
                     console.warn('[SCREEN AUDIO] Auto-resume failed for ' + peer_name, err);
@@ -6043,6 +6090,7 @@ function handleRemoteScreenAudio(stream, peer_id, peer_name) {
             const track = screenAudioTracks[0];
             track.onunmute = () => {
                 console.log('[SCREEN AUDIO] Track unmuted for ' + peer_name + ', ensuring playback');
+                screenAudioMedia.muted = false;
                 ensureScreenAudioPlaying();
             };
         }
@@ -6264,6 +6312,35 @@ function handleAudioFallback(audioMedia, peer_name) {
     document.addEventListener('click', playOnInteraction, { once: true });
     document.addEventListener('touchstart', playOnInteraction, { once: true });
     document.addEventListener('keydown', playOnInteraction, { once: true });
+}
+
+/**
+ * Unlock and resume all remote audio players on user interaction
+ */
+function unlockAllRemoteAudio() {
+    const container = audioMediaContainer || (typeof getId === 'function' ? getId('audioMediaContainer') : null);
+    if (container) {
+        const audioElements = container.querySelectorAll('audio');
+        audioElements.forEach((audio) => {
+            if (audio.srcObject && hasAudioTrack(audio.srcObject)) {
+                if (audio.muted) {
+                    audio.muted = false;
+                }
+                if (audio.paused) {
+                    audio.play().catch(() => {});
+                }
+            }
+        });
+    }
+    if (outputAudioContext && outputAudioContext.state === 'suspended') {
+        outputAudioContext.resume().catch((err) => console.warn('Output AudioContext resume', err));
+    }
+}
+
+if (typeof document !== 'undefined') {
+    ['click', 'touchstart', 'keydown', 'pointerdown'].forEach((evt) => {
+        document.addEventListener(evt, unlockAllRemoteAudio, { passive: true });
+    });
 }
 
 /**
@@ -10403,24 +10480,33 @@ async function loadScreenMedia() {
  * @param {boolean} init - Indicates if it's the initial screen share state
  */
 async function toggleScreenSharing(init = false) {
-    if (isScreenShareStarting) {
-        console.warn('[ScreenShare] Screen share start already in progress');
+    const now = Date.now();
+    if (now - lastScreenShareActionTime < 400) {
+        console.warn('[ScreenShare] Rapid screen share toggle debounced');
         return;
     }
+    if (isScreenShareStarting || isScreenShareStopping) {
+        console.warn('[ScreenShare] Screen share operation already in progress');
+        return;
+    }
+    lastScreenShareActionTime = now;
+
+    if (isScreenStreaming) {
+        await stopScreenSharing(init);
+        return;
+    }
+
     try {
-        if (!isScreenStreaming) {
-            isScreenShareStarting = true;
-            if (screenShareBtn) screenShareBtn.style.pointerEvents = 'none';
-            if (initScreenShareBtn) initScreenShareBtn.style.pointerEvents = 'none';
-        }
+        isScreenShareStarting = true;
+        if (screenShareBtn) screenShareBtn.style.pointerEvents = 'none';
+        if (initScreenShareBtn) initScreenShareBtn.style.pointerEvents = 'none';
+
         screenMaxFrameRate = parseInt(screenFpsSelect.value, 10);
         const constraints = getScreenShareConstraints();
         isVideoPrivacyActive = false;
         if (!init) emitPeerStatus('privacy', isVideoPrivacyActive);
 
-        !isScreenStreaming ? await startScreenSharing(constraints, init) : await stopScreenSharing(init);
-
-        updateScreenSharingUI(isScreenStreaming, init);
+        await startScreenSharing(constraints, init);
     } catch (err) {
         if (err && (err.name === 'NotAllowedError' || err.name === 'AbortError')) {
             console.warn('[ScreenShare] Screen sharing cancelled or permission denied:', err.message || err.name);
@@ -10432,6 +10518,7 @@ async function toggleScreenSharing(init = false) {
         isScreenShareStarting = false;
         if (screenShareBtn) screenShareBtn.style.pointerEvents = '';
         if (initScreenShareBtn) initScreenShareBtn.style.pointerEvents = '';
+        updateScreenSharingUI(isScreenStreaming, init);
     }
 }
 
@@ -10491,8 +10578,8 @@ async function startScreenSharing(constraints, init) {
     }
     screenVideoTrack.onended = () => {
         screenVideoTrack.onended = null;
-        if (isScreenStreaming && !isScreenShareStarting) {
-            toggleScreenSharing(init);
+        if (isScreenStreaming || isScreenShareStarting) {
+            stopScreenSharing(init);
         }
     };
     if (init) {
@@ -10522,94 +10609,107 @@ async function startScreenSharing(constraints, init) {
  * Stop screen sharing and clean up resources
  * @param {boolean} init - Indicates if it's the initial screen share
  */
-async function stopScreenSharing(init) {
-    // Immediately clear screen sharing flags so asynchronous track events or concurrent calls do not re-enter
-    isScreenStreaming = false;
-    myScreenStatus = false;
+async function stopScreenSharing(init = false) {
+    if (isScreenShareStopping) {
+        console.warn('[ScreenShare] Stop screen sharing already in progress');
+        return;
+    }
+    if (!isScreenStreaming && !localScreenMediaStream && !localScreenDisplayStream && !(init && initStream)) {
+        return;
+    }
+    isScreenShareStopping = true;
+    try {
+        // Immediately clear screen sharing flags so asynchronous track events or concurrent calls do not re-enter
+        isScreenStreaming = false;
+        myScreenStatus = false;
 
-    const myScreenWrap = getId('myScreenWrap');
-    const myScreenPinBtn = getId('myScreenPinBtn');
-    if (!init && myScreenWrap && isVideoPinned && pinnedVideoPlayerId === 'myScreen') {
-        console.log('[ScreenShare] Unpinning my screen before removal');
-        if (myScreenPinBtn) myScreenPinBtn.click();
-    }
-    if (!init) {
-        VideoDrawingOverlay.destroyById(myPeerId);
-        const screenWraps = document.querySelectorAll('#myScreenWrap, .Screen#myScreenWrap');
-        screenWraps.forEach((wrap) => {
-            const dropdown = wrap.querySelector('#myScreenDropdownBtn') || getId('myScreenDropdownBtn');
-            if (dropdown && dropdown._dropdownContent) {
-                dropdown._dropdownContent.remove();
-            }
-            wrap.remove();
-        });
-    }
-    const activeMicTrack = getAudioTrack(localAudioMediaStream);
-    if (localScreenMediaStream) {
-        localScreenMediaStream.getTracks().forEach((t) => {
-            if (activeMicTrack && t.id === activeMicTrack.id) return;
-            t.onended = null;
-            t.stop();
-        });
-    }
-    if (localScreenDisplayStream) {
-        localScreenDisplayStream.getTracks().forEach((t) => {
-            if (activeMicTrack && t.id === activeMicTrack.id) return;
-            t.onended = null;
-            t.stop();
-        });
-    }
-    localScreenDisplayStream = null;
-    if (screenShareAudioContext) {
-        try {
-            await screenShareAudioContext.close();
-        } catch (_) {}
-        screenShareAudioContext = null;
-    }
-    localScreenMediaStream = null;
-    if (!init) adaptAspectRatio();
-    if (!init) {
-        emitPeersAction('screenStop');
-        try {
-            peerInfo.extras = {};
-        } catch (_) {}
-        await emitPeerStatus('screen', false, {});
-        const micTrack = getAudioTrack(localAudioMediaStream);
-        if (useAudio && (!micTrack || micTrack.readyState === 'ended')) {
-            try {
-                await changeLocalMicrophone(audioInputSelect.value);
-                console.log('[ScreenShare] Require microphone after screen share stop');
-            } catch (err) {
-                console.error('[ScreenShare] Failed to reacquire microphone after screen share stop:', err);
-            }
-        } else {
-            if (micTrack) {
-                micTrack.enabled = true;
-                await refreshMyStreamToPeers(localAudioMediaStream, true);
-                console.log('[ScreenShare] Refreshing mic audio after screen share stop');
-            }
+        const myScreenWrap = getId('myScreenWrap');
+        const myScreenPinBtn = getId('myScreenPinBtn');
+        if (!init && myScreenWrap && isVideoPinned && pinnedVideoPlayerId === 'myScreen') {
+            console.log('[ScreenShare] Unpinning my screen before removal');
+            if (myScreenPinBtn) myScreenPinBtn.click();
         }
-        await refreshMyStreamToPeers(undefined, false);
-        screenReaderAccessibility.announceMessage('Screen sharing stopped');
-    }
-    if (init) {
-        if (initStream) await stopTracks(initStream);
-        if (useVideo && myVideoStatus) {
+        if (!init) {
+            VideoDrawingOverlay.destroyById(myPeerId);
+            const screenWraps = document.querySelectorAll('#myScreenWrap, .Screen#myScreenWrap');
+            screenWraps.forEach((wrap) => {
+                const dropdown = wrap.querySelector('#myScreenDropdownBtn') || getId('myScreenDropdownBtn');
+                if (dropdown && dropdown._dropdownContent) {
+                    dropdown._dropdownContent.remove();
+                }
+                wrap.remove();
+            });
+        }
+        const activeMicTrack = getAudioTrack(localAudioMediaStream);
+        if (localScreenMediaStream) {
+            localScreenMediaStream.getTracks().forEach((t) => {
+                if (activeMicTrack && t.id === activeMicTrack.id) return;
+                t.onended = null;
+                t.stop();
+            });
+        }
+        if (localScreenDisplayStream) {
+            localScreenDisplayStream.getTracks().forEach((t) => {
+                if (activeMicTrack && t.id === activeMicTrack.id) return;
+                t.onended = null;
+                t.stop();
+            });
+        }
+        localScreenDisplayStream = null;
+        if (screenShareAudioContext) {
             try {
-                await changeInitCamera(initVideoSelect.value);
-                initVideo.classList.toggle('mirror');
-            } catch (err) {
-                console.error('[ScreenShare] Error restarting camera after screen share stop:', err);
+                await screenShareAudioContext.close();
+            } catch (_) {}
+            screenShareAudioContext = null;
+        }
+        localScreenMediaStream = null;
+        if (!init) adaptAspectRatio();
+        if (!init) {
+            emitPeersAction('screenStop');
+            try {
+                peerInfo.extras = {};
+            } catch (_) {}
+            await emitPeerStatus('screen', false, {});
+            const micTrack = getAudioTrack(localAudioMediaStream);
+            if (useAudio && (!micTrack || micTrack.readyState === 'ended')) {
+                try {
+                    await changeLocalMicrophone(audioInputSelect.value);
+                    console.log('[ScreenShare] Require microphone after screen share stop');
+                } catch (err) {
+                    console.error('[ScreenShare] Failed to reacquire microphone after screen share stop:', err);
+                }
+            } else {
+                if (micTrack) {
+                    micTrack.enabled = true;
+                    await refreshMyStreamToPeers(localAudioMediaStream, true);
+                    console.log('[ScreenShare] Refreshing mic audio after screen share stop');
+                }
+            }
+            await refreshMyStreamToPeers(undefined, false);
+            screenReaderAccessibility.announceMessage('Screen sharing stopped');
+        }
+        if (init) {
+            if (initStream) await stopTracks(initStream);
+            if (useVideo && myVideoStatus) {
+                try {
+                    await changeInitCamera(initVideoSelect.value);
+                    initVideo.classList.toggle('mirror');
+                } catch (err) {
+                    console.error('[ScreenShare] Error restarting camera after screen share stop:', err);
+                    initStream = null;
+                    elemDisplay(initVideo, false);
+                }
+            } else {
                 initStream = null;
                 elemDisplay(initVideo, false);
+                initVideoContainerShow(false);
             }
-        } else {
-            initStream = null;
-            elemDisplay(initVideo, false);
-            initVideoContainerShow(false);
+            disable(initVideoSelect, false);
+            disable(initVideoBtn, false);
         }
-        disable(initVideoSelect, false);
-        disable(initVideoBtn, false);
+    } finally {
+        isScreenShareStopping = false;
+        updateScreenSharingUI(false, init);
     }
 }
 
@@ -10670,12 +10770,15 @@ function getLocalScreenExtras() {
     try {
         const track = getVideoTrack(localScreenMediaStream);
         const audioTrack = hasAudioTrack(localScreenMediaStream) ? getAudioTrack(localScreenMediaStream) : null;
+        const micTrack = hasAudioTrack(localAudioMediaStream) ? getAudioTrack(localAudioMediaStream) : null;
         return track
             ? {
                   screen_track_id: track.id,
                   screen_stream_id: localScreenMediaStream.id,
                   screen_audio_track_id: audioTrack ? audioTrack.id : undefined,
                   has_screen_audio: !!audioTrack,
+                  mic_audio_track_id: micTrack ? micTrack.id : undefined,
+                  mic_stream_id: localAudioMediaStream ? localAudioMediaStream.id : undefined,
               }
             : undefined;
     } catch (e) {
@@ -10888,22 +10991,37 @@ async function refreshMyStreamToPeers(stream, localAudioTrackChange = false, isC
         const audioSenders = senders.filter(
             (s) => (s.track && s.track.kind === 'audio') || s._mediaType === 'mic' || s._mediaType === 'screen_audio'
         );
-        let micSender = audioSenders.find(
-            (s) => s._mediaType === 'mic' || (s.track && micAudioTrack && s.track.id === micAudioTrack.id)
-        );
-        let screenAudioSender = audioSenders.find(
-            (s) =>
-                s._mediaType === 'screen_audio' ||
-                (s.track && screenAudioTrack && s.track.id === screenAudioTrack.id)
-        );
+        let micSender = pc._micSender && senders.includes(pc._micSender) ? pc._micSender : null;
+        let screenAudioSender =
+            pc._screenAudioSender && senders.includes(pc._screenAudioSender) ? pc._screenAudioSender : null;
+
+        if (!micSender) {
+            micSender = audioSenders.find(
+                (s) => s._mediaType === 'mic' || (s.track && micAudioTrack && s.track.id === micAudioTrack.id)
+            );
+        }
+        if (!screenAudioSender) {
+            screenAudioSender = audioSenders.find(
+                (s) =>
+                    s._mediaType === 'screen_audio' ||
+                    (s.track && screenAudioTrack && s.track.id === screenAudioTrack.id)
+            );
+        }
 
         if (!micSender && audioSenders.length > 0) {
             micSender = audioSenders.find((s) => s !== screenAudioSender);
-            if (micSender) micSender._mediaType = 'mic';
         }
         if (!screenAudioSender && audioSenders.length > 1) {
             screenAudioSender = audioSenders.find((s) => s !== micSender);
-            if (screenAudioSender) screenAudioSender._mediaType = 'screen_audio';
+        }
+
+        if (micSender) {
+            micSender._mediaType = 'mic';
+            pc._micSender = micSender;
+        }
+        if (screenAudioSender) {
+            screenAudioSender._mediaType = 'screen_audio';
+            pc._screenAudioSender = screenAudioSender;
         }
 
         // Microphone audio track management
@@ -10913,7 +11031,10 @@ async function refreshMyStreamToPeers(stream, localAudioTrackChange = false, isC
                 console.log('REPLACE MIC AUDIO TRACK TO', { peer_id, peer_name, micAudioTrack });
             } else {
                 const s = pc.addTrack(micAudioTrack, localAudioMediaStream || new MediaStream([micAudioTrack]));
-                if (s) s._mediaType = 'mic';
+                if (s) {
+                    s._mediaType = 'mic';
+                    pc._micSender = s;
+                }
                 await handleRtcOffer(peer_id);
                 console.log('ADD MIC AUDIO TRACK TO', { peer_id, peer_name, micAudioTrack });
             }
@@ -10926,7 +11047,10 @@ async function refreshMyStreamToPeers(stream, localAudioTrackChange = false, isC
                 console.log('REPLACE SCREEN AUDIO TRACK TO', { peer_id, peer_name, screenAudioTrack });
             } else {
                 const s = pc.addTrack(screenAudioTrack, localScreenMediaStream || new MediaStream([screenAudioTrack]));
-                if (s) s._mediaType = 'screen_audio';
+                if (s) {
+                    s._mediaType = 'screen_audio';
+                    pc._screenAudioSender = s;
+                }
                 await handleRtcOffer(peer_id);
                 console.log('ADD SCREEN AUDIO TRACK TO', { peer_id, peer_name, screenAudioTrack });
             }
@@ -10934,6 +11058,7 @@ async function refreshMyStreamToPeers(stream, localAudioTrackChange = false, isC
             if (screenAudioSender) {
                 try {
                     pc.removeTrack(screenAudioSender);
+                    pc._screenAudioSender = null;
                     await handleRtcOffer(peer_id);
                     console.log('REMOVE SCREEN AUDIO SENDER FROM', { peer_id, peer_name });
                 } catch (e) {
@@ -14502,6 +14627,16 @@ function setPeerAudioStatus(peer_id, status) {
     }
     if (peerAudioVolume) {
         elemDisplay(peerAudioVolume, status);
+        if (status && !isMobileDevice) {
+            const peerAudioMedia = getId(peer_id + '___audio');
+            if (peerAudioMedia) {
+                try {
+                    handleAudioVolume(peerAudioVolume.id, peerAudioMedia.id);
+                } catch (e) {
+                    console.warn('[AUDIO] handleAudioVolume in setPeerAudioStatus failed', e);
+                }
+            }
+        }
     }
 }
 
@@ -15308,8 +15443,8 @@ function setMyVideoOff(peer_name) {
  * @param {string} peer_name peer name
  */
 function setMyScreenOff(peer_name) {
-    if (isScreenStreaming) {
-        toggleScreenSharing();
+    if (isScreenStreaming || localScreenMediaStream) {
+        stopScreenSharing(false);
         userLog('toast', `${icons.user} ${peer_name} \n has stopped your screen sharing`);
         playSound('off');
     }
@@ -18699,6 +18834,23 @@ function handlePeerVolume(data) {
     const { peer_id, volume } = data;
 
     if (volume === 0) return;
+
+    // Self-healing: if incoming volume packets indicate peer is speaking,
+    // ensure their audio playback element is unmuted and actively playing.
+    const peerAudio = getId(peer_id + '___audio');
+    if (peerAudio) {
+        const userSetVolume = Number(peerAudio.dataset.peerVolume);
+        if (isNaN(userSetVolume) || userSetVolume > 0) {
+            if (peerAudio.muted) {
+                peerAudio.muted = false;
+            }
+            if (peerAudio.paused) {
+                peerAudio.play().catch((err) => {
+                    console.warn('[AUDIO] Auto-play resume on peer volume packet:', err);
+                });
+            }
+        }
+    }
 
     const audioColorTmp = getVolumeColor(volume);
 
