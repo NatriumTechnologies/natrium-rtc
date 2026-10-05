@@ -65,6 +65,8 @@ const axios = require('axios');
 const jwt = require('jsonwebtoken');
 const app = express();
 const fs = require('fs');
+const vm = require('vm');
+const { execSync } = require('child_process');
 const checkXSS = require('./xss.js');
 const ServerApi = require('./api');
 const MattermostController = require('./mattermost');
@@ -464,6 +466,87 @@ if (ipWhitelist.enabled && !trustProxy) {
 
 app.use(helmet.noSniff()); // Enable content type sniffing prevention
 app.use(applyEmbedHeaders); // Apply iframe embedding restrictions (CSP frame-ancestors / X-Frame-Options)
+
+// =========================================================================
+// ASSET INTEGRITY & SELF-HEALING MIDDLEWARE FOR CLIENT.JS
+// Protects against corrupt editor buffer saves, truncation, or syntax errors.
+// =========================================================================
+let validatedClientJsCache = {
+    content: null,
+    mtime: 0,
+};
+
+function getSafeClientJs() {
+    const clientJsPath = path.join(dir.public, 'js', 'client.js');
+    try {
+        if (!fs.existsSync(clientJsPath)) {
+            return null;
+        }
+        const stat = fs.statSync(clientJsPath);
+        if (validatedClientJsCache.content && validatedClientJsCache.mtime === stat.mtimeMs) {
+            return validatedClientJsCache.content;
+        }
+
+        const rawContent = fs.readFileSync(clientJsPath, 'utf8');
+
+        // Check for truncation markers or suspicious truncation
+        if (rawContent.includes('... [truncated') || rawContent.length < 50000) {
+            throw new Error(`Suspicious client.js content (length: ${rawContent.length}, contains truncation marker)`);
+        }
+
+        // Test compilation with Node V8 VM
+        new vm.Script(rawContent, { filename: 'client.js' });
+
+        // Content is completely valid
+        validatedClientJsCache = {
+            content: rawContent,
+            mtime: stat.mtimeMs,
+        };
+        return rawContent;
+    } catch (err) {
+        log.error('[CRITICAL ASSET INTEGRITY] Corrupted or truncated client.js detected on disk!', {
+            error: err.message,
+        });
+
+        // Auto-heal: attempt to restore clean file from git HEAD
+        try {
+            log.warn('[CRITICAL ASSET INTEGRITY] Auto-healing: restoring public/js/client.js from git HEAD...');
+            execSync('git checkout public/js/client.js', { cwd: path.join(__dirname, '../..') });
+            const restoredContent = fs.readFileSync(clientJsPath, 'utf8');
+            new vm.Script(restoredContent, { filename: 'client.js' });
+            validatedClientJsCache = {
+                content: restoredContent,
+                mtime: fs.statSync(clientJsPath).mtimeMs,
+            };
+            log.info('[CRITICAL ASSET INTEGRITY] Successfully auto-healed client.js from git HEAD.');
+            return restoredContent;
+        } catch (healErr) {
+            log.error('[CRITICAL ASSET INTEGRITY] Auto-heal failed:', healErr.message);
+            if (validatedClientJsCache.content) {
+                return validatedClientJsCache.content;
+            }
+            return null;
+        }
+    }
+}
+
+// Initial warm-up and boot check
+try {
+    getSafeClientJs();
+} catch (_) {}
+
+// Intercept requests for /js/client.js and /mattermost/js/client.js
+app.use((req, res, next) => {
+    if (req.path === '/js/client.js' || req.path === '/mattermost/js/client.js') {
+        const safeCode = getSafeClientJs();
+        if (safeCode) {
+            res.setHeader('Content-Type', 'application/javascript; charset=UTF-8');
+            res.setHeader('Cache-Control', 'no-cache');
+            return res.send(safeCode);
+        }
+    }
+    next();
+});
 
 // Use all static files from the public folder
 const staticOptions = {
